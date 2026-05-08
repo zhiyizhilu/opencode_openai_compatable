@@ -4,7 +4,7 @@ import { Readable } from 'stream';
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | any[];
 }
 
 interface ChatCompletionRequest {
@@ -272,15 +272,16 @@ export class OpenAIServer {
     messages: ChatMessage[],
     temperature?: number
   ): Promise<void> {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
     try {
+      // 先获取完整内容（当前实现为伪流式），确保在设置 SSE header 前捕获错误
       const content = await this.openCodeClient.chat(messages, {
         model,
         temperature
       });
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
 
       const chunks = this.splitIntoChunks(content, 10);
 
@@ -321,14 +322,24 @@ export class OpenAIServer {
       res.end();
     } catch (error: any) {
       console.error('[OpenAI Server] 流式响应失败:', error.message);
-      res.write(`data: ${JSON.stringify({
-        error: {
-          message: `Stream failed: ${error.message}`,
-          type: 'server_error',
-          code: 'internal_error'
-        }
-      })}\n\n`);
-      res.end();
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: {
+            message: `Chat completion failed: ${error.message}`,
+            type: 'server_error',
+            code: 'internal_error'
+          }
+        });
+      } else {
+        res.write(`data: ${JSON.stringify({
+          error: {
+            message: `Stream failed: ${error.message}`,
+            type: 'server_error',
+            code: 'internal_error'
+          }
+        })}\n\n`);
+        res.end();
+      }
     }
   }
 
@@ -402,15 +413,16 @@ export class OpenAIServer {
     messages: ChatMessage[],
     temperature?: number
   ): Promise<void> {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
     try {
+      // 先获取完整内容，确保在设置 SSE header 前捕获错误
       const content = await this.openCodeClient.chat(messages, {
         model,
         temperature
       });
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
 
       const chunks = this.splitIntoChunks(content, 10);
 
@@ -448,14 +460,24 @@ export class OpenAIServer {
       res.end();
     } catch (error: any) {
       console.error('[OpenAI Server] 流式响应失败:', error.message);
-      res.write(`data: ${JSON.stringify({
-        error: {
-          message: `Stream failed: ${error.message}`,
-          type: 'server_error',
-          code: 'internal_error'
-        }
-      })}\n\n`);
-      res.end();
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: {
+            message: `Completion failed: ${error.message}`,
+            type: 'server_error',
+            code: 'internal_error'
+          }
+        });
+      } else {
+        res.write(`data: ${JSON.stringify({
+          error: {
+            message: `Stream failed: ${error.message}`,
+            type: 'server_error',
+            code: 'internal_error'
+          }
+        })}\n\n`);
+        res.end();
+      }
     }
   }
 

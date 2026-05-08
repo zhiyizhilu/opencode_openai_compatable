@@ -203,13 +203,29 @@ export class OpenCodeClient {
   }
 
   /**
+   * 从消息内容中提取纯文本（兼容字符串和数组格式）
+   */
+  private extractTextContent(content: string | any[]): string {
+    if (typeof content === 'string') {
+      return content;
+    }
+    if (Array.isArray(content)) {
+      return content
+        .filter((part: any) => part && part.type === 'text' && typeof part.text === 'string')
+        .map((part: any) => part.text)
+        .join('');
+    }
+    return String(content || '');
+  }
+
+  /**
    * 发送聊天消息
    * 使用官方 REST API：
    *   1. POST /session  -> 创建会话
    *   2. POST /session/:id/message -> 发送消息并获取回复
    * 参考: https://opencode.ai/docs/zh-cn/server/#消息
    */
-  async chat(messages: Array<{ role: string; content: string }>, options: {
+  async chat(messages: Array<{ role: string; content: string | any[] }>, options: {
     model?: string;
     temperature?: number;
     stream?: boolean;
@@ -232,7 +248,8 @@ export class OpenCodeClient {
         throw new Error('创建会话失败：未返回 session id');
       }
     } catch (err: any) {
-      throw new Error(`OpenCode 创建会话失败: ${err.message}`);
+      const detail = err.response?.data ? JSON.stringify(err.response.data).substring(0, 300) : '';
+      throw new Error(`OpenCode 创建会话失败: ${err.message} ${detail}`);
     }
 
     // 第二步：取最后一条用户消息内容发送
@@ -241,12 +258,17 @@ export class OpenCodeClient {
       throw new Error('没有用户消息可发送');
     }
 
+    const textContent = this.extractTextContent(lastUserMessage.content);
+    if (!textContent) {
+      throw new Error('用户消息内容为空');
+    }
+
     // 构建消息体（官方格式）
     const messageBody: any = {
       parts: [
         {
           type: 'text',
-          text: lastUserMessage.content
+          text: textContent
         }
       ]
     };

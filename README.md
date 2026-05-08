@@ -168,8 +168,17 @@ opencode-openai-server [options]
 - **服务器**: Express.js
 - **客户端**: 复用现有的 OpenCodeClient 类
 - **语言**: TypeScript
-- **端口**: 默认 4094
-- **OpenCode 端口**: 4095
+
+### 端口说明
+
+本服务采用**双端口架构**：
+
+| 端口 | 角色 | 说明 |
+|------|------|------|
+| **4094** | OpenAI 兼容 API 服务端口 | Express.js 服务器监听的端口，对外暴露 OpenAI 兼容的 REST 接口（`/v1/chat/completions`、`/v1/models` 等）。**用户应连接此端口**，就像连接标准的 OpenAI API 一样。 |
+| **4095** | OpenCode CLI 原生服务端口 | 由服务启动时自动通过 `opencode serve --port 4095` 启动的 OpenCode 本地 HTTP API 服务。`OpenCodeClient` 内部通过此端口与 OpenCode CLI 通信（创建会话、发送消息等）。**用户通常不需要直接访问此端口**。 |
+
+> 工作流程：用户 → **端口 4094**（OpenAI 格式请求）→ OpenAI Server（格式转换）→ **端口 4095**（OpenCode 原生 API）→ AI 模型 → 反向返回响应。
 
 ## 文件结构
 
@@ -186,8 +195,8 @@ opencode/
 ## 注意事项
 
 1. 确保 OpenCode CLI 已正确安装并可用
-2. 服务启动时会自动启动 OpenCode 本地服务
-3. 默认使用端口 4094，确保端口未被占用
+2. 服务启动时会自动在 **端口 4095** 启动 OpenCode 本地服务（通过 `opencode serve`），请不要手动占用此端口
+3. **端口 4094** 是对外提供 OpenAI 兼容 API 的入口，确保此端口未被占用；如需更改，使用 `-p` 参数
 4. 流式响应使用 SSE (Server-Sent Events) 格式
 5. 不需要真实的 API key，可以使用任意字符串
 
