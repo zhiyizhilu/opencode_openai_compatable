@@ -1,18 +1,22 @@
-# OpenAI 兼容的 OpenCode API 服务器
+﻿# OpenAI 兼容的 OpenCode API 服务器
 
 将 OpenCode 本地服务转换为 OpenAI 兼容的 REST API，支持所有主要的 OpenAI API 端点。
 
 ## 功能特性
 
-- ✅ 完全兼容 OpenAI API 格式
-- ✅ 支持所有主要端点：
+- 完全兼容 OpenAI API 格式
+- 支持所有主要端点：
   - `POST /v1/chat/completions` - 对话补全（支持流式）
   - `GET /v1/models` - 列出可用模型
-  - `POST /v1/completions` - 文本补全
-- ✅ 支持流式响应（SSE）
-- ✅ 自动模型映射
-- ✅ CORS 支持
-- ✅ 错误处理和日志记录
+  - `GET /v1/models/:model` - 获取模型详情
+  - `POST /v1/completions` - 文本补全（支持流式）
+- **真正的流式响应**：通过 OpenCode 的 SSE 事件流实现实时推送，SSE 失败时自动回退到伪流式
+- 支持 OpenCode 服务器认证（Basic Auth）
+- 自动模型映射
+- CORS 支持
+- 额外的 OpenCode 代理端点（`/opencode/agents`、`/opencode/config`）
+- 请求日志
+- 错误处理和优雅降级
 
 ## 快速开始
 
@@ -25,7 +29,7 @@ npm install
 ### 启动服务
 
 ```bash
-# 使用默认端口 4094
+# 使用默认端口
 npm start
 
 # 使用自定义端口
@@ -33,16 +37,53 @@ npm run dev -- -p 8080
 
 # 指定 OpenCode CLI 路径
 npm run dev -- -c /path/to/opencode
+
+# 启用认证
+npm run dev -- --username admin --password mysecret
+```
+
+### 端口说明
+
+服务采用**双端口架构**，两个端口分工明确：
+
+| 端口 | 角色 | 说明 | 配置方式 |
+|------|------|------|----------|
+| **4094** | OpenAI 兼容 API（对外） | 用户直接请求的入口，提供 OpenAI 格式的 REST API。对此端口的请求会被自动翻译并转发到 OpenCode 原生服务。 | 通过 `-p` 参数修改 |
+| **4095** | OpenCode 原生服务（对内） | OpenCode CLI 启动的内部 HTTP API 服务（`opencode serve --port 4095`），供端口 4094 调用。对用户透明，无需直接访问。 | 通过 `--opencode-port` 参数修改 |
+
+**请求处理流程**：
+
+```
+用户/客户端 -> 端口 4094 (OpenAI 兼容层) --转发--> 端口 4095 (OpenCode 原生 API) --> AI 模型
+                  |
+                  └-- 返回 OpenAI 格式响应 <-- 翻译响应 <--------------┘
+```
+
+**流式响应流程（SSE 事件流）**：
+
+```
+用户/客户端 --stream=true--> 端口 4094
+                                    |
+                                    +-- 订阅 OpenCode SSE /event --> 实时接收增量文本
+                                    +-- 异步发送消息 /session/:id/prompt_async
+                                    |
+                                    └-- 实时推送 OpenAI 格式 SSE chunks --> 用户/客户端
 ```
 
 ### 服务端点
 
-启动后，服务将在 `http://127.0.0.1:4094` 上运行：
+OpenAI 兼容服务在端口 4094 上暴露以下端点：
 
 - **健康检查**: `GET http://127.0.0.1:4094/health`
 - **模型列表**: `GET http://127.0.0.1:4094/v1/models`
 - **对话补全**: `POST http://127.0.0.1:4094/v1/chat/completions`
 - **文本补全**: `POST http://127.0.0.1:4094/v1/completions`
+
+OpenCode 代理端点：
+
+- **OpenCode 健康状态**: `GET http://127.0.0.1:4094/opencode/health`
+- **代理列表**: `GET http://127.0.0.1:4094/opencode/agents`
+- **配置信息**: `GET http://127.0.0.1:4094/opencode/config`
 
 ## API 使用示例
 
@@ -95,7 +136,7 @@ curl -X POST http://127.0.0.1:4094/v1/completions \
 
 ## 使用 OpenAI SDK
 
-由于 API 完全兼容 OpenAI 格式，你可以直接使用 OpenAI 官方 SDK：
+由于 API 完全兼容 OpenAI 格式，你可以直接使用 OpenAI 官方 SDK。
 
 ### Python 示例
 
@@ -158,47 +199,81 @@ main();
 opencode-openai-server [options]
 
 选项:
-  -p, --port <number>    服务器端口 (默认: 4094)
-  -c, --cli-path <path>  OpenCode CLI 路径 (默认: 自动检测)
-  -h, --help             显示帮助信息
+  -p, --port <number>           OpenAI 兼容服务端口 (默认: 4094)
+  -H, --hostname <string>       监听主机名 (默认: 127.0.0.1)
+  --opencode-port <number>      OpenCode 原生服务端口 (默认: 4095)
+  -c, --cli-path <path>         OpenCode CLI 路径 (默认: 自动检测)
+  --cors <origins>              额外允许的浏览器来源 (逗号分隔，可多次使用)
+  --username <string>           OpenCode 服务器认证用户名 (或设置 OPENCODE_SERVER_USERNAME)
+  --password <string>           OpenCode 服务器认证密码 (或设置 OPENCODE_SERVER_PASSWORD)
+  -h, --help                    显示帮助信息
+  -V, --version                 显示版本号
+```
+
+### 认证
+
+如果 OpenCode 服务器启用了认证，可以通过命令行参数或环境变量传递凭据：
+
+```bash
+# 方式一：命令行参数
+npm start -- --username admin --password mysecret
+
+# 方式二：环境变量
+OPENCODE_SERVER_USERNAME=admin OPENCODE_SERVER_PASSWORD=mysecret npm start
+```
+
+### CORS 配置
+
+```bash
+# 允许特定来源
+npm start -- --cors http://localhost:5173 --cors https://app.example.com
+
+# 逗号分隔
+npm start -- --cors "http://localhost:5173,https://app.example.com"
 ```
 
 ## 技术架构
 
 - **服务器**: Express.js
-- **客户端**: 复用现有的 OpenCodeClient 类
+- **客户端**: 通过 OpenCode 官方 REST API (`opencode serve`) 通信
+- **流式响应**: 优先使用 OpenCode SSE 事件流 (`GET /event`)，失败时回退到伪流式
 - **语言**: TypeScript
 
-### 端口说明
+### 核心改造点（v2.0）
 
-本服务采用**双端口架构**：
+基于 OpenCode 官方文档，相比 v1.0 的主要改进：
 
-| 端口 | 角色 | 说明 |
-|------|------|------|
-| **4094** | OpenAI 兼容 API 服务端口 | Express.js 服务器监听的端口，对外暴露 OpenAI 兼容的 REST 接口（`/v1/chat/completions`、`/v1/models` 等）。**用户应连接此端口**，就像连接标准的 OpenAI API 一样。 |
-| **4095** | OpenCode CLI 原生服务端口 | 由服务启动时自动通过 `opencode serve --port 4095` 启动的 OpenCode 本地 HTTP API 服务。`OpenCodeClient` 内部通过此端口与 OpenCode CLI 通信（创建会话、发送消息等）。**用户通常不需要直接访问此端口**。 |
-
-> 工作流程：用户 → **端口 4094**（OpenAI 格式请求）→ OpenAI Server（格式转换）→ **端口 4095**（OpenCode 原生 API）→ AI 模型 → 反向返回响应。
+1. **真正的流式响应**：利用 OpenCode 的 SSE 事件流（`GET /event`）+ 异步消息发送（`POST /session/:id/prompt_async`），实现从 OpenCode 到客户端的实时增量文本推送
+2. **认证支持**：支持 `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` 基本认证
+3. **system 消息传递**：利用 OpenCode `POST /session/:id/message` 的 `system` 参数
+4. **代理选择**：利用 OpenCode 的 `agent` 参数选择不同代理
+5. **更多 CLI 选项**：`--hostname`、`--opencode-port`、`--cors`、`--username`、`--password`
+6. **OpenCode 代理端点**：新增 `/opencode/health`、`/opencode/agents`、`/opencode/config`
+7. **优雅降级**：SSE 流式失败时自动回退到伪流式
 
 ## 文件结构
 
 ```
 opencode/
-├── opencode-client.ts              # OpenCode 原始客户端
-├── opencode-openai-server.ts       # OpenAI 兼容服务器
-├── opencode-openai-server-cli.ts   # CLI 启动脚本
+├── opencode-client.ts              # OpenCode 原始客户端（支持 SSE 流式、认证）
+├── opencode-openai-server.ts       # OpenAI 兼容服务器（真正流式 + 伪流式回退）
+├── opencode-openai-server-cli.ts   # CLI 启动脚本（完整参数支持）
+├── test.ts                         # 测试脚本
 ├── package.json                    # 项目配置
 ├── tsconfig.json                   # TypeScript 配置
+├── start-server.bat                # Windows 启动脚本
 └── README.md                       # 本文件
 ```
 
 ## 注意事项
 
 1. 确保 OpenCode CLI 已正确安装并可用
-2. 服务启动时会自动在 **端口 4095** 启动 OpenCode 本地服务（通过 `opencode serve`），请不要手动占用此端口
-3. **端口 4094** 是对外提供 OpenAI 兼容 API 的入口，确保此端口未被占用；如需更改，使用 `-p` 参数
-4. 流式响应使用 SSE (Server-Sent Events) 格式
-5. 不需要真实的 API key，可以使用任意字符串
+2. **端口 4094** 是对外提供 OpenAI 兼容 API 的入口；如需更改，使用 `-p` 参数
+3. **端口 4095** 是 OpenCode 原生服务的内部端口（由 `opencode serve` 启动）；如需更改，使用 `--opencode-port` 参数
+4. 两个端口不能相同
+5. 流式响应优先使用 SSE 事件流实现真正的实时推送，失败时自动回退到伪流式
+6. 不需要真实的 API key，可以使用任意字符串
+7. 如果启用了 OpenCode 认证，请通过 `--username` 和 `--password` 或环境变量提供凭据
 
 ## 故障排除
 
@@ -208,6 +283,12 @@ opencode/
 
 ```bash
 npm start -- -p 8080
+```
+
+如果端口 4095 被占用，使用其他端口：
+
+```bash
+npm start -- --opencode-port 4097
 ```
 
 ### OpenCode CLI 未找到
@@ -221,8 +302,14 @@ npm start -- -c /path/to/opencode
 ### 服务启动失败
 
 1. 检查 OpenCode CLI 是否已安装：`npm install -g opencode-ai`
-2. 检查端口是否被占用
+2. 检查端口 4094 和 4095 是否被占用
 3. 查看日志输出获取详细错误信息
+
+### 流式响应不工作
+
+1. 检查 OpenCode 服务是否正常运行（访问 `/opencode/health`）
+2. 服务器会自动回退到伪流式模式
+3. 查看 `[OpenAI Server]` 日志中是否有 SSE 相关错误
 
 ## 许可证
 

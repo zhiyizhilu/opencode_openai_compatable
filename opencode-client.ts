@@ -1,13 +1,14 @@
 import { spawn, ChildProcess } from 'child_process';
-import axios from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
+import { EventEmitter } from 'events';
 
 /**
  * OpenCode 本地客户端
  * 通过 opencode serve 暴露的官方 HTTP REST API 通信
- * 参考文档: https://opencode.ai/docs/zh-cn/server/
+ * 参考文档: https://opencode.ai/docs/server/
  */
 export class OpenCodeClient {
   private baseUrl: string = 'http://127.0.0.1:4095';
@@ -15,29 +16,46 @@ export class OpenCodeClient {
   private cliPath: string = '';
   private isStarting: boolean = false;
   private startPromise: Promise<void> | null = null;
+  private username: string = '';
+  private password: string = '';
+  private httpClient: AxiosInstance;
 
-  constructor(cliPath?: string) {
-    this.cliPath = cliPath || this.findCliPath();
+  constructor(options?: { cliPath?: string; opencodePort?: number; username?: string; password?: string }) {
+    this.cliPath = options?.cliPath || this.findCliPath();
+    if (options?.opencodePort) {
+      this.baseUrl = `http://127.0.0.1:${options.opencodePort}`;
+    }
+    if (options?.username) this.username = options.username;
+    if (options?.password) this.password = options.password;
+
+    this.httpClient = axios.create({
+      baseURL: this.baseUrl,
+      timeout: 120000,
+      headers: this.getAuthHeaders(),
+    });
   }
 
-  /**
-   * 自动查找 OpenCode CLI 路径
-   */
+  /** 构建认证头 */
+  private getAuthHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (this.username || this.password) {
+      const credentials = Buffer.from(`${this.username || 'opencode'}:${this.password}`).toString('base64');
+      headers['Authorization'] = `Basic ${credentials}`;
+    }
+    return headers;
+  }
+
+  /** 自动查找 OpenCode CLI 路径 */
   private findCliPath(): string {
     const platform = os.platform();
     const home = os.homedir();
-    
     const candidates: string[] = [];
-    
+
     if (platform === 'win32') {
-      // Windows 候选路径 - npm 全局安装通常使用 .cmd 文件
       const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
-      
       candidates.push(
-        // fnm 安装路径
         path.join(home, 'AppData', 'Roaming', 'fnm', 'node-versions', 'v22.21.1', 'installation', 'opencode.cmd'),
         path.join(home, 'AppData', 'Roaming', 'npm', 'opencode.cmd'),
-        // 其他常见路径
         path.join(home, '.opencode', 'bin', 'opencode.exe'),
         path.join(home, '.opencode', 'bin', 'opencode.cmd'),
         path.join(localAppData, 'Programs', 'opencode', 'opencode.exe'),
@@ -46,7 +64,6 @@ export class OpenCodeClient {
         'opencode'
       );
     } else if (platform === 'darwin') {
-      // macOS 候选路径
       candidates.push(
         path.join(home, '.opencode', 'bin', 'opencode'),
         '/usr/local/bin/opencode',
@@ -54,7 +71,6 @@ export class OpenCodeClient {
         'opencode'
       );
     } else {
-      // Linux 候选路径
       candidates.push(
         path.join(home, '.opencode', 'bin', 'opencode'),
         '/usr/local/bin/opencode',
@@ -63,42 +79,30 @@ export class OpenCodeClient {
       );
     }
 
-    // 检查哪个路径存在
     for (const candidate of candidates) {
       try {
         if (fs.existsSync(candidate)) {
           console.log('[OpenCode] 找到 CLI:', candidate);
           return candidate;
         }
-      } catch (e) {
-        // 继续检查下一个
-      }
+      } catch (e) { /* continue */ }
     }
 
-    // 尝试从 PATH 中查找
     console.log('[OpenCode] 未找到 CLI 文件，尝试使用 PATH 中的 opencode');
     return platform === 'win32' ? 'opencode.cmd' : 'opencode';
   }
 
-  /**
-   * 检查 OpenCode 服务是否已启动
-   * 使用官方 /global/health 端点
-   */
-  private async isServiceRunning(): Promise<boolean> {
+  /** 检查 OpenCode 服务是否已启动（官方 GET /global/health） */
+  async isServiceRunning(): Promise<boolean> {
     try {
-      const response = await axios.get(`${this.baseUrl}/global/health`, {
-        timeout: 2000
-      });
+      const response = await this.httpClient.get('/global/health', { timeout: 2000 });
       return response.status === 200 && response.data?.healthy === true;
     } catch (e) {
       return false;
     }
   }
 
-  /**
-   * 启动 OpenCode 本地服务
-   * 使用 opencode serve 命令，默认端口 4095
-   */
+  /** 启动 OpenCode 本地服务（opencode serve） */
   private async startService(): Promise<void> {
     if (this.isStarting && this.startPromise) {
       return this.startPromise;
@@ -108,39 +112,40 @@ export class OpenCodeClient {
     this.startPromise = new Promise((resolve, reject) => {
       console.log('[OpenCode] 正在启动本地服务，CLI 路径:', this.cliPath);
 
-      // Windows 上执行 .cmd 文件需要 shell: true
       const isWindows = os.platform() === 'win32';
       const useShell = isWindows || this.cliPath.endsWith('.cmd') || this.cliPath.endsWith('.ps1');
-      
-      // 使用 opencode serve 启动 HTTP API 服务（官方文档推荐）
-      // 默认监听 http://127.0.0.1:4095
-      const port = '4095';
+
+      // 从 baseUrl 提取端口号
+      const port = this.baseUrl.split(':').pop() || '4095';
+
+      // 构建环境变量，支持认证
+      const env: Record<string, string> = { ...process.env as Record<string, string> };
+      if (this.password) {
+        env['OPENCODE_SERVER_PASSWORD'] = this.password;
+        if (this.username) {
+          env['OPENCODE_SERVER_USERNAME'] = this.username;
+        }
+      }
+
       this.process = spawn(this.cliPath, ['serve', '--port', port, '--hostname', '127.0.0.1'], {
         detached: false,
         windowsHide: true,
         shell: useShell,
-        env: { ...process.env }
+        env,
       });
-
-      let output = '';
-      let errorOutput = '';
 
       this.process.stdout?.on('data', (data) => {
         const text = data.toString();
-        output += text;
         console.log('[OpenCode]', text.trim());
-
-        // 检查输出中是否包含服务地址
         const match = text.match(/https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/i);
         if (match) {
           this.baseUrl = match[0];
+          this.httpClient.defaults.baseURL = this.baseUrl;
         }
       });
 
       this.process.stderr?.on('data', (data) => {
-        const text = data.toString();
-        errorOutput += text;
-        console.error('[OpenCode stderr]', text.trim());
+        console.error('[OpenCode stderr]', data.toString().trim());
       });
 
       this.process.on('error', (err) => {
@@ -156,7 +161,7 @@ export class OpenCodeClient {
         this.process = null;
       });
 
-      // 等待服务启动（轮询 /global/health）
+      // 轮询 /global/health 等待服务就绪
       const checkInterval = setInterval(async () => {
         if (await this.isServiceRunning()) {
           clearInterval(checkInterval);
@@ -167,7 +172,6 @@ export class OpenCodeClient {
         }
       }, 500);
 
-      // 30秒超时
       const timeout = setTimeout(() => {
         clearInterval(checkInterval);
         this.isStarting = false;
@@ -182,9 +186,7 @@ export class OpenCodeClient {
     return this.startPromise;
   }
 
-  /**
-   * 确保服务已启动
-   */
+  /** 确保服务已启动 */
   async ensureStarted(): Promise<void> {
     if (await this.isServiceRunning()) {
       return;
@@ -192,9 +194,7 @@ export class OpenCodeClient {
     await this.startService();
   }
 
-  /**
-   * 停止服务
-   */
+  /** 停止服务 */
   async stop(): Promise<void> {
     if (this.process) {
       this.process.kill();
@@ -202,8 +202,173 @@ export class OpenCodeClient {
     }
   }
 
+  /** 获取服务健康状态 */
+  async getHealth(): Promise<{ healthy: boolean; version: string }> {
+    const resp = await this.httpClient.get('/global/health');
+    return resp.data;
+  }
+
+  /** 列出所有项目 */
+  async listProjects(): Promise<any[]> {
+    const resp = await this.httpClient.get('/project');
+    return resp.data;
+  }
+
+  /** 获取当前项目 */
+  async getCurrentProject(): Promise<any> {
+    const resp = await this.httpClient.get('/project/current');
+    return resp.data;
+  }
+
+  /** 获取配置信息 */
+  async getConfig(): Promise<any> {
+    const resp = await this.httpClient.get('/config');
+    return resp.data;
+  }
+
+  /** 列出所有可用代理 */
+  async listAgents(): Promise<any[]> {
+    const resp = await this.httpClient.get('/agent');
+    return resp.data;
+  }
+
+  /** 创建新会话 */
+  async createSession(options?: { parentID?: string; title?: string }): Promise<any> {
+    const resp = await this.httpClient.post('/session', options || {});
+    return resp.data;
+  }
+
+  /** 获取会话详情 */
+  async getSession(sessionId: string): Promise<any> {
+    const resp = await this.httpClient.get(`/session/${sessionId}`);
+    return resp.data;
+  }
+
+  /** 删除会话 */
+  async deleteSession(sessionId: string): Promise<boolean> {
+    const resp = await this.httpClient.delete(`/session/${sessionId}`);
+    return resp.data;
+  }
+
+  /** 列出会话中的消息 */
+  async listMessages(sessionId: string, limit?: number): Promise<any[]> {
+    const params: any = {};
+    if (limit) params.limit = limit;
+    const resp = await this.httpClient.get(`/session/${sessionId}/message`, { params });
+    return resp.data;
+  }
+
+  /** 发送消息并等待响应（同步） */
+  async sendMessage(sessionId: string, options: {
+    messageID?: string;
+    model?: { providerID: string; modelID: string };
+    agent?: string;
+    system?: string;
+    parts: Array<{ type: string; text: string }>;
+  }): Promise<{ info: any; parts: any[] }> {
+    const body: any = { parts: options.parts };
+    if (options.messageID) body.messageID = options.messageID;
+    if (options.model) body.model = options.model;
+    if (options.agent) body.agent = options.agent;
+    if (options.system) body.system = options.system;
+
+    const resp = await this.httpClient.post(`/session/${sessionId}/message`, body);
+    return resp.data;
+  }
+
+  /** 异步发送消息（不等待响应） */
+  async sendMessageAsync(sessionId: string, options: {
+    messageID?: string;
+    model?: { providerID: string; modelID: string };
+    agent?: string;
+    system?: string;
+    parts: Array<{ type: string; text: string }>;
+  }): Promise<void> {
+    const body: any = { parts: options.parts };
+    if (options.messageID) body.messageID = options.messageID;
+    if (options.model) body.model = options.model;
+    if (options.agent) body.agent = options.agent;
+    if (options.system) body.system = options.system;
+
+    await this.httpClient.post(`/session/${sessionId}/prompt_async`, body);
+  }
+
+  /** 中止正在运行的会话 */
+  async abortSession(sessionId: string): Promise<boolean> {
+    const resp = await this.httpClient.post(`/session/${sessionId}/abort`);
+    return resp.data;
+  }
+
+  /** 获取会话差异 */
+  async getSessionDiff(sessionId: string, messageID?: string): Promise<any[]> {
+    const params: any = {};
+    if (messageID) params.messageID = messageID;
+    const resp = await this.httpClient.get(`/session/${sessionId}/diff`, { params });
+    return resp.data;
+  }
+
+  /** 订阅 SSE 事件流（GET /event） */
+  subscribeEvents(): EventEmitter & { close: () => void } {
+    const emitter = new EventEmitter() as EventEmitter & { close: () => void };
+    const controller = new AbortController();
+
+    const url = `${this.baseUrl}/event`;
+
+    (async () => {
+      try {
+        const response = await fetch(url, {
+          headers: this.getAuthHeaders(),
+          signal: controller.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          emitter.emit('error', new Error(`SSE 连接失败: ${response.status}`));
+          return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              try {
+                const event = JSON.parse(data);
+                emitter.emit('event', event);
+                // 根据事件类型分发
+                if (event.type) {
+                  emitter.emit(event.type, event);
+                }
+              } catch {
+                // 忽略非 JSON 数据
+              }
+            } else if (line.startsWith('event: ')) {
+              // SSE event type 行
+            }
+          }
+        }
+      } catch (err: any) {
+        if (err.name !== 'AbortError') {
+          emitter.emit('error', err);
+        }
+      }
+    })();
+
+    emitter.close = () => controller.abort();
+    return emitter;
+  }
+
   /**
-   * 从消息内容中提取纯文本（兼容字符串和数组格式）
+   * 从消息内容中提取纯文本
    */
   private extractTextContent(content: string | any[]): string {
     if (typeof content === 'string') {
@@ -219,30 +384,21 @@ export class OpenCodeClient {
   }
 
   /**
-   * 发送聊天消息
-   * 使用官方 REST API：
-   *   1. POST /session  -> 创建会话
-   *   2. POST /session/:id/message -> 发送消息并获取回复
-   * 参考: https://opencode.ai/docs/zh-cn/server/#消息
+   * 发送聊天消息（非流式）
+   * 流程：创建会话 -> 发送消息 -> 提取回复 -> 清理会话
    */
   async chat(messages: Array<{ role: string; content: string | any[] }>, options: {
     model?: string;
     temperature?: number;
-    stream?: boolean;
+    agent?: string;
+    system?: string;
   } = {}): Promise<string> {
     await this.ensureStarted();
 
-    // 第一步：创建新会话
+    // 创建新会话
     let sessionId: string;
     try {
-      const sessionResp = await axios.post(
-        `${this.baseUrl}/session`,
-        {},
-        {
-          headers: { 'Content-Type': 'application/json' },
-          timeout: 10000
-        }
-      );
+      const sessionResp = await this.httpClient.post('/session', {});
       sessionId = sessionResp.data?.id;
       if (!sessionId) {
         throw new Error('创建会话失败：未返回 session id');
@@ -252,107 +408,260 @@ export class OpenCodeClient {
       throw new Error(`OpenCode 创建会话失败: ${err.message} ${detail}`);
     }
 
-    // 第二步：取最后一条用户消息内容发送
-    const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
-    if (!lastUserMessage) {
-      throw new Error('没有用户消息可发送');
-    }
-
-    const textContent = this.extractTextContent(lastUserMessage.content);
-    if (!textContent) {
-      throw new Error('用户消息内容为空');
-    }
-
-    // 构建消息体（官方格式）
-    const messageBody: any = {
-      parts: [
-        {
-          type: 'text',
-          text: textContent
-        }
-      ]
-    };
-
-    // 如果指定了模型，解析 providerID/modelID
-    if (options.model && options.model !== 'auto') {
-      const parts = options.model.split('/');
-      if (parts.length >= 2) {
-        messageBody.model = {
-          providerID: parts[0],
-          modelID: parts.slice(1).join('/')
-        };
-      }
-    }
-
     try {
-      const msgResp = await axios.post(
-        `${this.baseUrl}/session/${sessionId}/message`,
-        messageBody,
-        {
-          headers: { 'Content-Type': 'application/json' },
-          timeout: 120000
-        }
-      );
+      // 取最后一条用户消息
+      const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
+      if (!lastUserMessage) {
+        throw new Error('没有用户消息可发送');
+      }
 
-      // 官方响应格式: { info: Message, parts: Part[] }
+      const textContent = this.extractTextContent(lastUserMessage.content);
+      if (!textContent) {
+        throw new Error('用户消息内容为空');
+      }
+
+      // 构建消息体
+      const messageBody: any = {
+        parts: [{ type: 'text', text: textContent }],
+      };
+
+      // 传递 system 消息
+      const systemMessage = options.system || messages.find(m => m.role === 'system');
+      if (systemMessage) {
+        messageBody.system = typeof systemMessage === 'string' ? systemMessage : this.extractTextContent(
+          typeof systemMessage.content === 'string' ? systemMessage.content : (systemMessage as any).content || ''
+        );
+      }
+
+      // 传递模型
+      if (options.model && options.model !== 'auto') {
+        const parts = options.model.split('/');
+        if (parts.length >= 2) {
+          messageBody.model = { providerID: parts[0], modelID: parts.slice(1).join('/') };
+        }
+      }
+
+      // 传递代理
+      if (options.agent) {
+        messageBody.agent = options.agent;
+      }
+
+      const msgResp = await this.httpClient.post(`/session/${sessionId}/message`, messageBody);
+
       const parts = msgResp.data?.parts;
       if (!Array.isArray(parts)) {
         console.error('[OpenCode] 返回数据:', JSON.stringify(msgResp.data).substring(0, 300));
         throw new Error('OpenCode 返回内容为空');
       }
 
-      // 从 parts 中提取文本内容（assistant 的回复）
-      const textContent = parts
+      const replyText = parts
         .filter((p: any) => p.type === 'text' && p.text)
         .map((p: any) => p.text)
         .join('');
 
-      if (!textContent) {
+      if (!replyText) {
         console.error('[OpenCode] parts 数据:', JSON.stringify(parts).substring(0, 300));
         throw new Error('OpenCode 返回内容为空');
       }
 
-      // 异步清理会话（不阻塞结果返回）
-      axios.delete(`${this.baseUrl}/session/${sessionId}`).catch(() => {});
+      // 异步清理会话
+      this.httpClient.delete(`/session/${sessionId}`).catch(() => {});
 
-      return textContent;
+      return replyText;
     } catch (err: any) {
-      // 清理失败的会话
-      axios.delete(`${this.baseUrl}/session/${sessionId}`).catch(() => {});
+      this.httpClient.delete(`/session/${sessionId}`).catch(() => {});
+      throw err;
+    }
+  }
+
+  /**
+   * 流式聊天（通过 SSE 事件流实现真正的流式响应）
+   * 流程：创建会话 -> 订阅事件流 -> 异步发送消息 -> 实时接收事件 -> 清理
+   */
+  async chatStream(
+    messages: Array<{ role: string; content: string | any[] }>,
+    onChunk: (text: string) => void,
+    options: {
+      model?: string;
+      temperature?: number;
+      agent?: string;
+      system?: string;
+    } = {}
+  ): Promise<string> {
+    await this.ensureStarted();
+
+    // 创建新会话
+    let sessionId: string;
+    try {
+      const sessionResp = await this.httpClient.post('/session', {});
+      sessionId = sessionResp.data?.id;
+      if (!sessionId) {
+        throw new Error('创建会话失败：未返回 session id');
+      }
+    } catch (err: any) {
+      const detail = err.response?.data ? JSON.stringify(err.response.data).substring(0, 300) : '';
+      throw new Error(`OpenCode 创建会话失败: ${err.message} ${detail}`);
+    }
+
+    try {
+      // 取最后一条用户消息
+      const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
+      if (!lastUserMessage) {
+        throw new Error('没有用户消息可发送');
+      }
+
+      const textContent = this.extractTextContent(lastUserMessage.content);
+      if (!textContent) {
+        throw new Error('用户消息内容为空');
+      }
+
+      // 构建消息体
+      const messageBody: any = {
+        parts: [{ type: 'text', text: textContent }],
+      };
+
+      const systemMessage = options.system || messages.find(m => m.role === 'system');
+      if (systemMessage) {
+        messageBody.system = typeof systemMessage === 'string' ? systemMessage : this.extractTextContent(
+          typeof systemMessage.content === 'string' ? systemMessage.content : (systemMessage as any).content || ''
+        );
+      }
+
+      if (options.model && options.model !== 'auto') {
+        const parts = options.model.split('/');
+        if (parts.length >= 2) {
+          messageBody.model = { providerID: parts[0], modelID: parts.slice(1).join('/') };
+        }
+      }
+
+      if (options.agent) {
+        messageBody.agent = options.agent;
+      }
+
+      // 订阅 SSE 事件流
+      const eventSource = this.subscribeEvents();
+
+      return new Promise<string>((resolve, reject) => {
+        let fullText = '';
+        let resolved = false;
+
+        const cleanup = () => {
+          eventSource.close();
+          // 异步清理会话
+          this.httpClient.delete(`/session/${sessionId}`).catch(() => {});
+        };
+
+        // 监听消息相关事件
+        // OpenCode SSE 事件格式: { type: string, properties: { ... } }
+        // 关键事件类型:
+        //   message.part.delta  - 流式增量文本 { sessionID, messageID, partID, field: "text", delta: "增量文本" }
+        //   message.part.updated - 文本部分完整更新 { sessionID, part: { type, text, ... } }
+        //   session.idle         - 会话完成
+        //   session.status       - 会话状态变化 { status: { type: "busy"|"idle" } }
+        eventSource.on('event', (event: any) => {
+          const props = event.properties || {};
+
+          // 只处理当前会话的事件
+          if (props.sessionID && props.sessionID !== sessionId) return;
+
+          // 流式增量文本事件（真正的 token-by-token 推送）
+          if (event.type === 'message.part.delta' && props.field === 'text' && props.delta) {
+            fullText += props.delta;
+            onChunk(props.delta);
+          }
+
+          // 文本部分完整更新事件（备用，用于兜底获取完整文本）
+          if (event.type === 'message.part.updated') {
+            const part = props.part;
+            if (part?.type === 'text' && part?.text) {
+              // 如果还没有收到过 delta 事件，用 updated 事件作为增量源
+              if (!fullText) {
+                fullText = part.text;
+                onChunk(part.text);
+              } else if (part.text.length > fullText.length && part.text.startsWith(fullText)) {
+                // 部分文本比已收到的长，取增量
+                const delta = part.text.slice(fullText.length);
+                fullText = part.text;
+                onChunk(delta);
+              }
+            }
+          }
+
+          // 会话空闲 = 完成
+          if (event.type === 'session.idle') {
+            if (!resolved) {
+              resolved = true;
+              cleanup();
+              resolve(fullText);
+            }
+          }
+        });
+
+        eventSource.on('error', (err: any) => {
+          if (!resolved) {
+            resolved = true;
+            cleanup();
+            // 如果已收到部分文本，返回它而不是报错
+            if (fullText) {
+              resolve(fullText);
+            } else {
+              reject(err);
+            }
+          }
+        });
+
+        // 异步发送消息（不等待完整响应，通过 SSE 流式接收）
+        this.sendMessageAsync(sessionId, messageBody).catch(err => {
+          if (!resolved) {
+            resolved = true;
+            cleanup();
+            reject(err);
+          }
+        });
+
+        // 超时保护（5分钟）
+        setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            cleanup();
+            if (fullText) {
+              resolve(fullText);
+            } else {
+              reject(new Error('流式响应超时'));
+            }
+          }
+        }, 300000);
+      });
+    } catch (err: any) {
+      this.httpClient.delete(`/session/${sessionId}`).catch(() => {});
       throw err;
     }
   }
 
   /**
    * 列出可用模型
-   * 通过官方 /config/providers 接口获取所有提供商的模型列表
+   * 通过官方 GET /config/providers 接口获取所有提供商的模型列表
    */
   async listModels(): Promise<string[]> {
     await this.ensureStarted();
 
     try {
-      // 使用官方 GET /config/providers 接口
-      const response = await axios.get(`${this.baseUrl}/config/providers`, {
-        timeout: 10000
-      });
-
-      // 官方响应格式: { providers: Provider[], default: { [key: string]: string } }
+      const response = await this.httpClient.get('/config/providers');
       const payload = response.data?.data || response.data || {};
       const providers = Array.isArray(payload.providers) ? payload.providers :
                        Array.isArray(payload) ? payload : [];
-      
+
       const models: string[] = [];
-      
+
       for (const provider of providers) {
         const providerID = String(provider?.id || '').trim();
         if (!providerID) continue;
-        
+
         const providerModels = provider.models;
         if (Array.isArray(providerModels)) {
-          // 模型是数组格式
           for (const item of providerModels) {
             const modelID = String(
-              typeof item === 'string' ? item : 
+              typeof item === 'string' ? item :
               item?.id || item?.model || item?.name || ''
             ).trim();
             if (modelID) {
@@ -360,7 +669,6 @@ export class OpenCodeClient {
             }
           }
         } else if (providerModels && typeof providerModels === 'object') {
-          // 模型是对象格式（key-value）
           for (const key of Object.keys(providerModels)) {
             if (key.trim()) {
               models.push(`${providerID}/${key.trim()}`);
@@ -368,44 +676,38 @@ export class OpenCodeClient {
           }
         }
       }
-      
-      // 去重并排序
+
       return [...new Set(models)].sort((a, b) => a.localeCompare(b));
     } catch (e) {
       console.error('[OpenCode] 获取模型列表失败:', e);
-      // 返回默认的免费模型列表
-      return [
-        'opencode/mimo-v2-omni-free',
-        'opencode/mimo-v2-pro-free',
-        'opencode/minimax-m2.5-free',
-        'opencode/nemotron-3-super-free',
-        'opencode/big-pickle',
-        'opencode/gpt-5-nano'
-      ];
+      return this.getDefaultFreeModels();
     }
   }
 
-  /**
-   * 获取 OpenCode 免费模型列表（硬编码，作为备用）
-   */
+  /** 获取默认免费模型列表（作为备用） */
   getDefaultFreeModels(): string[] {
     return [
       'opencode/mimo-v2-omni-free',
-      'opencode/mimo-v2-pro-free', 
+      'opencode/mimo-v2-pro-free',
       'opencode/minimax-m2.5-free',
       'opencode/nemotron-3-super-free',
       'opencode/big-pickle',
-      'opencode/gpt-5-nano'
+      'opencode/gpt-5-nano',
     ];
+  }
+
+  /** 获取 baseUrl */
+  getBaseUrl(): string {
+    return this.baseUrl;
   }
 }
 
 // 单例实例
 let clientInstance: OpenCodeClient | null = null;
 
-export function getOpenCodeClient(cliPath?: string): OpenCodeClient {
+export function getOpenCodeClient(options?: { cliPath?: string; opencodePort?: number; username?: string; password?: string }): OpenCodeClient {
   if (!clientInstance) {
-    clientInstance = new OpenCodeClient(cliPath);
+    clientInstance = new OpenCodeClient(options);
   }
   return clientInstance;
 }
@@ -418,14 +720,13 @@ export function resetOpenCodeClient(): void {
 }
 
 /**
- * 检测 OpenCode CLI 是否已安装，返回检测到的路径
+ * 检测 OpenCode CLI 是否已安装
  */
 export function detectOpenCodePath(): { found: boolean; path: string; message: string } {
   const platform = os.platform();
   const home = os.homedir();
-  
   const candidates: string[] = [];
-  
+
   if (platform === 'win32') {
     const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
     candidates.push(
@@ -451,15 +752,13 @@ export function detectOpenCodePath(): { found: boolean; path: string; message: s
       path.join(home, '.local', 'bin', 'opencode')
     );
   }
-  
-  // 检查文件是否存在
+
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
       return { found: true, path: candidate, message: '检测到 OpenCode CLI' };
     }
   }
-  
-  // 尝试使用 which/where 命令查找
+
   try {
     const { execSync } = require('child_process');
     const cmd = platform === 'win32' ? 'where opencode' : 'which opencode';
@@ -468,9 +767,7 @@ export function detectOpenCodePath(): { found: boolean; path: string; message: s
     if (foundPath && fs.existsSync(foundPath)) {
       return { found: true, path: foundPath, message: '检测到 OpenCode CLI' };
     }
-  } catch {
-    // 命令执行失败，继续返回未找到
-  }
-  
+  } catch { /* continue */ }
+
   return { found: false, path: '', message: '未检测到 OpenCode CLI，请先安装：npm install -g opencode-ai' };
 }
