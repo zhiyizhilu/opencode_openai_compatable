@@ -30,7 +30,7 @@ export class OpenCodeClient {
 
     this.httpClient = axios.create({
       baseURL: this.baseUrl,
-      timeout: 120000,
+      timeout: 300000,
       headers: this.getAuthHeaders(),
     });
   }
@@ -470,7 +470,9 @@ export class OpenCodeClient {
         messageBody.agent = options.agent;
       }
 
-      const msgResp = await this.httpClient.post(`/session/${sessionId}/message`, messageBody);
+      const msgResp = await this.httpClient.post(`/session/${sessionId}/message`, messageBody, {
+        timeout: 300000,
+      });
 
       const parts = msgResp.data?.parts;
       if (!Array.isArray(parts)) {

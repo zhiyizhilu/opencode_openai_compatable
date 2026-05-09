@@ -1,4 +1,4 @@
-# OpenAI 兼容的 OpenCode API 服务器 v2.0
+﻿# OpenAI 兼容的 OpenCode API 服务器 v2.0
 
 将 OpenCode 本地服务转换为 OpenAI 兼容的 REST API，支持所有主要的 OpenAI API 端点。
 
@@ -11,17 +11,22 @@
   - `GET /v1/models/:model` - 获取模型详情
   - `POST /v1/completions` - 文本补全（支持流式）
 - **真正的流式响应**：通过 OpenCode 的 SSE 事件流实现实时推送，SSE 失败时自动回退到伪流式
-- **Tool/Function Calling**：支持 OpenAI 格式的 `tools` 和 `tool_choice` 参数（`none` / `auto` / `required` / 指定函数），自动转换为 OpenCode 工具调用协议
+- **Tool/Function Calling**：支持 OpenAI 格式的 `tools` 和 `tool_choice` 参数（`none` / `auto` / `required` / 指定函数），通过 `«tool_call»` / `«/tool_call»` 标签实现工具调用协议
 - **思考链（Reasoning）内容**：支持 `reasoning_content` 字段，在流式和非流式响应中回传模型的思考过程
+- **`response_format` 支持**：支持 `json_object` 和 `json_schema` 两种响应格式，自动注入 JSON Schema 指令到系统消息
 - **多模态消息内容支持**：兼容 OpenAI 数组格式的消息内容（`content: string | any[]`），自动提取文本部分
+- **Token 用量报告**：在响应中返回 `prompt_tokens`、`completion_tokens`、`total_tokens`、`reasoning_tokens`、`cached_tokens` 等用量信息；流式响应可通过 `stream_options.include_usage` 控制
+- **完整 OpenAI 请求参数**：支持 `temperature`、`top_p`、`max_tokens`、`max_completion_tokens`、`stop`、`n`、`seed`、`frequency_penalty`、`presence_penalty`、`logprobs`、`top_logprobs` 等参数
+- **系统指纹**：返回 `system_fingerprint` 字段，便于追踪服务端版本
 - **代理选择**：支持通过 `agent` 参数选择 OpenCode 的不同代理
+- **OpenCode CLI 检测**：内置 `detectOpenCodePath()` 函数，自动检测 CLI 安装路径，支持多平台
 - **全局 CLI 安装**：支持通过 `npm install -g` 全局安装为命令行工具
 - 支持 OpenCode 服务器认证（Basic Auth）
-- 自动模型映射
+- 自动模型映射（通过 `GET /config/providers` 获取）
 - CORS 支持
 - 额外的 OpenCode 代理端点（`/opencode/health`、`/opencode/agents`、`/opencode/config`）
 - 请求日志
-- 错误处理和优雅降级
+- 错误处理和优雅降级（流式超时回退）
 
 ## 快速开始
 
@@ -39,6 +44,9 @@ npm start
 
 # 使用自定义端口
 npm run dev -- -p 8080
+
+# 指定监听主机名
+npm run dev -- -H 0.0.0.0
 
 # 指定 OpenCode CLI 路径
 npm run dev -- -c /path/to/opencode
@@ -275,33 +283,33 @@ npm start -- --cors "http://localhost:5173,https://app.example.com"
 2. **认证支持**：支持 `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` 基本认证
 3. **system 消息传递**：利用 OpenCode `POST /session/:id/message` 的 `system` 参数
 4. **代理选择**：利用 OpenCode 的 `agent` 参数选择不同代理
-5. **更多 CLI 选项**：`--hostname`、`--opencode-port`、`--cors`、`--username`、`--password`
+5. **更多 CLI 选项**：`-H` / `--hostname`、`--opencode-port`、`--cors`、`--username`、`--password`
 6. **OpenCode 代理端点**：新增 `/opencode/health`、`/opencode/agents`、`/opencode/config`
 7. **优雅降级**：SSE 流式失败时自动回退到伪流式
 8. **思考链内容**：支持 `reasoning_content` 在流式和非流式响应中返回模型的思考过程
 9. **Tool/Function Calling 增强**：支持 `tool_choice` 的 `none` / `auto` / `required` / 指定函数四种模式
+10. **`response_format` 支持**：支持 `json_object` 和 `json_schema`，自动注入 JSON Schema 指令到系统消息
+11. **`max_completion_tokens`**：支持 OpenAI 新版参数名称兼容
+12. **Token 用量报告**：在非流式和流式响应中报告 `prompt_tokens`、`completion_tokens`、`total_tokens`、`reasoning_tokens`；流式响应可通过 `stream_options.include_usage` 控制
+13. **完整 OpenAI 参数支持**：`temperature`、`top_p`、`stop`、`n`、`seed`、`frequency_penalty`、`presence_penalty`、`logprobs`、`top_logprobs`
 
 ## 文件结构
 
 ```
 opencode/
-├── opencode-client.ts              # OpenCode 原生客户端（支持 SSE 流式、认证、会话管理）
-├── opencode-openai-server.ts       # OpenAI 兼容服务器（真正流式 + 伪流式回退 + Tool Calling）
-├── opencode-openai-server-cli.ts   # CLI 启动脚本（完整参数支持）
-├── test.ts                         # 集成测试脚本
-├── package.json                    # 项目配置
-├── tsconfig.json                   # TypeScript 配置
+├── opencode-client.ts              # OpenCode 原生客户端（SSE 流式、认证、会话管理、模型列表）
+├── opencode-openai-server.ts       # OpenAI 兼容服务器（流式 + 回退 + Tool Calling + 12 个端点）
+├── opencode-openai-server-cli.ts   # CLI 启动脚本（Commander，完整参数支持）
+├── test.ts                         # 集成测试脚本（8 个测试用例）
+├── package.json                    # 项目配置（Express + Axios + Commander）
+├── tsconfig.json                   # TypeScript 配置（ES2020、Strict）
 ├── start-server.bat                # Windows 启动脚本
 ├── 服务器 _ OpenCode.md             # OpenCode 原生服务 API 参考文档
 ├── dist/                           # TypeScript 编译输出（`npm run build` 生成）
-│   ├── opencode-client.js
-│   ├── opencode-client.d.ts
-│   ├── opencode-openai-server.js
-│   ├── opencode-openai-server.d.ts
-│   ├── opencode-openai-server-cli.js
-│   ├── opencode-openai-server-cli.d.ts
-│   ├── test.js
-│   └── test.d.ts
+│   ├── opencode-client.js / .d.ts / .js.map / .d.ts.map
+│   ├── opencode-openai-server.js / .d.ts / .js.map / .d.ts.map
+│   ├── opencode-openai-server-cli.js / .d.ts / .js.map / .d.ts.map
+│   ├── test.js / .d.ts / .js.map / .d.ts.map
 ├── .gitignore                      # Git 忽略规则
 └── README.md                       # 本文件
 ```
@@ -317,6 +325,7 @@ opencode/
 7. 如果启用了 OpenCode 认证，请通过 `--username` 和 `--password` 或环境变量提供凭据
 8. 消息内容支持字符串和数组两种格式，兼容 OpenAI 多模态消息结构
 9. `dist/` 目录是 TypeScript 编译产物，运行集成测试前需执行 `npm run build`
+10. 工具调用使用 `«tool_call»` / `«/tool_call»` 标签包裹 JSON 格式的函数调用请求
 
 ## 故障排除
 

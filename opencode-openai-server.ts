@@ -443,7 +443,6 @@ export class OpenAIServer {
         const numChoices = Math.min(n, 1);
 
         if (parsedToolCalls && parsedToolCalls.length > 0) {
-          const textContent = this.extractTextOutsideToolCalls(result.content);
           const response: ChatCompletionResponse = {
             id: completionId,
             object: 'chat.completion',
@@ -454,7 +453,7 @@ export class OpenAIServer {
               index: 0,
               message: {
                 role: 'assistant',
-                content: textContent || null,
+                content: null,
                 reasoning_content: result.reasoning || null,
                 tool_calls: parsedToolCalls,
               },
@@ -503,8 +502,15 @@ export class OpenAIServer {
     } catch (error: any) {
       console.error('[OpenAI Server] Chat completion \u5931\u8D25:', error.message);
       if (!res.headersSent) {
-        res.status(500).json({
-          error: { message: `Chat completion failed: ${error.message}`, type: 'server_error', code: 'internal_error' },
+        const isTimeout = error.code === 'ECONNABORTED' || error.message?.includes('timeout');
+        res.status(isTimeout ? 504 : 500).json({
+          error: {
+            message: isTimeout
+              ? 'Model response timed out. The model may be overloaded or the request too complex.'
+              : `Chat completion failed: ${error.message}`,
+            type: isTimeout ? 'timeout_error' : 'server_error',
+            code: isTimeout ? 'timeout' : 'internal_error',
+          },
         });
       }
     }
@@ -521,12 +527,16 @@ export class OpenAIServer {
     includeUsage?: boolean,
     systemFingerprint?: string,
   ): Promise<void> {
-    try {
-      await this.streamChatViaSSE(req, res, completionId, created, model, messages, tools, includeUsage, systemFingerprint);
-    } catch (sseError: any) {
-      console.warn('[OpenAI Server] SSE \u6D41\u5F0F\u5931\u8D25\uFF0C\u56DE\u9000\u5230\u4F2A\u6D41\u5F0F:', sseError.message);
-      if (!res.headersSent) {
-        await this.streamChatFallback(req, res, completionId, created, model, messages, tools, includeUsage, systemFingerprint);
+    if (tools && tools.length > 0) {
+      await this.streamChatWithToolSupport(req, res, completionId, created, model, messages, tools, includeUsage, systemFingerprint);
+    } else {
+      try {
+        await this.streamChatViaSSE(req, res, completionId, created, model, messages, undefined, includeUsage, systemFingerprint);
+      } catch (sseError: any) {
+        console.warn('[OpenAI Server] SSE \u6D41\u5F0F\u5931\u8D25\uFF0C\u56DE\u9000\u5230\u4F2A\u6D41\u5F0F:', sseError.message);
+        if (!res.headersSent) {
+          await this.streamChatFallback(req, res, completionId, created, model, messages, undefined, includeUsage, systemFingerprint);
+        }
       }
     }
   }
@@ -588,61 +598,146 @@ export class OpenAIServer {
 
     await this.openCodeClient.chatStream(messages, onChunk, { model }, onReasoning);
 
-    if (tools) {
-      const parsedToolCalls = this.parseToolCallsFromResponse(fullText);
-      if (parsedToolCalls && parsedToolCalls.length > 0) {
-        for (let i = 0; i < parsedToolCalls.length; i++) {
-          const tc = parsedToolCalls[i];
-          const tcChunk: ChatCompletionChunk = {
+    const finalChunk: ChatCompletionChunk = {
+      id: completionId,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      system_fingerprint: fp,
+      choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
+      ...(includeUsage ? {
+        usage: {
+          prompt_tokens: this.estimateTokens(messages),
+          completion_tokens: this.estimateTokens([{ role: 'assistant', content: fullText }]),
+          total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: fullText }]),
+        },
+      } : {}),
+    };
+    res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+
+    res.write('data: [DONE]\n\n');
+    res.end();
+  }
+
+  private async streamChatWithToolSupport(
+    req: Request,
+    res: Response,
+    completionId: string,
+    created: number,
+    model: string,
+    messages: ChatMessage[],
+    tools: ToolDefinition[],
+    includeUsage?: boolean,
+    systemFingerprint?: string,
+  ): Promise<void> {
+    const fp = systemFingerprint || `fp_${this.hashString(model).substr(0, 12)}`;
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const roleChunk: ChatCompletionChunk = {
+      id: completionId,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      system_fingerprint: fp,
+      choices: [{ index: 0, delta: { role: 'assistant' }, logprobs: null, finish_reason: null }],
+    };
+    res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
+
+    const keepAliveInterval = setInterval(() => {
+      res.write(': keep-alive\n\n');
+    }, 5000);
+
+    let fullText = '';
+    let fullReasoning = '';
+
+    const onChunk = (delta: string) => {
+      fullText += delta;
+    };
+
+    const onReasoning = (delta: string) => {
+      fullReasoning += delta;
+    };
+
+    try {
+      await this.openCodeClient.chatStream(messages, onChunk, { model }, onReasoning);
+    } finally {
+      clearInterval(keepAliveInterval);
+    }
+
+    const parsedToolCalls = this.parseToolCallsFromResponse(fullText);
+
+    if (parsedToolCalls && parsedToolCalls.length > 0) {
+      for (let i = 0; i < parsedToolCalls.length; i++) {
+        const tc = parsedToolCalls[i];
+        const tcChunk: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          system_fingerprint: fp,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: i,
+                id: tc.id,
+                type: 'function' as const,
+                function: { name: tc.function.name, arguments: tc.function.arguments },
+              }],
+            },
+            logprobs: null,
+            finish_reason: null,
+          }],
+        };
+        res.write(`data: ${JSON.stringify(tcChunk)}\n\n`);
+      }
+      const finalChunk: ChatCompletionChunk = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        system_fingerprint: fp,
+        choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'tool_calls' }],
+        ...(includeUsage ? {
+          usage: {
+            prompt_tokens: this.estimateTokens(messages),
+            completion_tokens: this.estimateTokens([{ role: 'assistant', content: fullText }]),
+            total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: fullText }]),
+          },
+        } : {}),
+      };
+      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+    } else {
+      if (fullReasoning) {
+        const reasoningChunks = this.splitIntoChunks(fullReasoning, 10);
+        for (const chunk of reasoningChunks) {
+          const data: ChatCompletionChunk = {
             id: completionId,
             object: 'chat.completion.chunk',
             created,
             model,
             system_fingerprint: fp,
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: i,
-                  id: tc.id,
-                  type: 'function' as const,
-                  function: { name: tc.function.name, arguments: tc.function.arguments },
-                }],
-              },
-              logprobs: null,
-              finish_reason: null,
-            }],
+            choices: [{ index: 0, delta: { reasoning_content: chunk }, logprobs: null, finish_reason: null }],
           };
-          res.write(`data: ${JSON.stringify(tcChunk)}\n\n`);
+          res.write(`data: ${JSON.stringify(data)}\n\n`);
         }
-        const finalChunk: ChatCompletionChunk = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          system_fingerprint: fp,
-          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'tool_calls' }],
-        };
-        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-      } else {
-        const finalChunk: ChatCompletionChunk = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          system_fingerprint: fp,
-          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
-          ...(includeUsage ? {
-            usage: {
-              prompt_tokens: this.estimateTokens(messages),
-              completion_tokens: this.estimateTokens([{ role: 'assistant', content: fullText }]),
-              total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: fullText }]),
-            },
-          } : {}),
-        };
-        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       }
-    } else {
+      const chunks = this.splitIntoChunks(fullText, 10);
+      for (const chunk of chunks) {
+        const data: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          system_fingerprint: fp,
+          choices: [{ index: 0, delta: { content: chunk }, logprobs: null, finish_reason: null }],
+        };
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      }
       const finalChunk: ChatCompletionChunk = {
         id: completionId,
         object: 'chat.completion.chunk',
@@ -672,7 +767,7 @@ export class OpenAIServer {
     created: number,
     model: string,
     messages: ChatMessage[],
-    tools?: ToolDefinition[],
+    _tools?: ToolDefinition[],
     includeUsage?: boolean,
     systemFingerprint?: string,
   ): Promise<void> {
@@ -725,78 +820,22 @@ export class OpenAIServer {
       await this.delay(30);
     }
 
-    if (tools) {
-      const parsedToolCalls = this.parseToolCallsFromResponse(result.content);
-      if (parsedToolCalls && parsedToolCalls.length > 0) {
-        for (let i = 0; i < parsedToolCalls.length; i++) {
-          const tc = parsedToolCalls[i];
-          const tcChunk: ChatCompletionChunk = {
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            system_fingerprint: fp,
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: i,
-                  id: tc.id,
-                  type: 'function' as const,
-                  function: { name: tc.function.name, arguments: tc.function.arguments },
-                }],
-              },
-              logprobs: null,
-              finish_reason: null,
-            }],
-          };
-          res.write(`data: ${JSON.stringify(tcChunk)}\n\n`);
-        }
-        const finalChunk: ChatCompletionChunk = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          system_fingerprint: fp,
-          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'tool_calls' }],
-        };
-        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-      } else {
-        const finalChunk: ChatCompletionChunk = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          system_fingerprint: fp,
-          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
-          ...(includeUsage ? {
-            usage: {
-              prompt_tokens: this.estimateTokens(messages),
-              completion_tokens: this.estimateTokens([{ role: 'assistant', content: result.content }]),
-              total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: result.content }]),
-            },
-          } : {}),
-        };
-        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-      }
-    } else {
-      const finalChunk: ChatCompletionChunk = {
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        system_fingerprint: fp,
-        choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
-        ...(includeUsage ? {
-          usage: {
-            prompt_tokens: this.estimateTokens(messages),
-            completion_tokens: this.estimateTokens([{ role: 'assistant', content: result.content }]),
-            total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: result.content }]),
-          },
-        } : {}),
-      };
-      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-    }
+    const finalChunk: ChatCompletionChunk = {
+      id: completionId,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      system_fingerprint: fp,
+      choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
+      ...(includeUsage ? {
+        usage: {
+          prompt_tokens: this.estimateTokens(messages),
+          completion_tokens: this.estimateTokens([{ role: 'assistant', content: result.content }]),
+          total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: result.content }]),
+        },
+      } : {}),
+    };
+    res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
 
     res.write('data: [DONE]\n\n');
     res.end();
