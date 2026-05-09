@@ -224,8 +224,8 @@ interface OpenAIServerOptions {
   password?: string;
 }
 
-const TOOL_CALL_OPEN_TAG = '\u276Etool_call\u276F';
-const TOOL_CALL_CLOSE_TAG = '\u276E/tool_call\u276F';
+const TOOL_CALL_OPEN_TAG = '<tool_call]';
+const TOOL_CALL_CLOSE_TAG = '[/tool_call>';
 
 // ==================== 服务器 ====================
 
@@ -377,6 +377,39 @@ export class OpenAIServer {
       top_logprobs, stream_options, max_completion_tokens,
     } = req.body as ChatCompletionRequest;
 
+    // 调试日志：查看 Trae 发送的完整请求内容
+    console.log(`[Debug] ========== 新请求 ==========`);
+    console.log(`[Debug] model: ${model}, stream: ${stream}, n: ${n}`);
+    console.log(`[Debug] tool_choice: ${JSON.stringify(tool_choice)}`);
+    if (tools && tools.length > 0) {
+      console.log(`[Debug] tools 数量: ${tools.length}`);
+      for (const tool of tools) {
+        console.log(`[Debug] tool: ${JSON.stringify(tool, null, 2).substring(0, 500)}`);
+      }
+    }
+    
+    const systemMsg = messages.find(m => m.role === 'system');
+    if (systemMsg) {
+      const sysContent = typeof systemMsg.content === 'string'
+        ? systemMsg.content.substring(0, 500)
+        : JSON.stringify(systemMsg.content).substring(0, 500);
+      console.log(`[Debug] System msg: ${sysContent}...`);
+    }
+    
+    // 打印所有消息的角色和类型
+    console.log(`[Debug] 消息历史 (${messages.length} 条):`);
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const contentPreview = typeof msg.content === 'string' 
+        ? msg.content.substring(0, 80).replace(/\n/g, '\\n')
+        : (msg.content ? `[${typeof msg.content}]` : 'null');
+      const toolCallsInfo = msg.tool_calls ? ` [tool_calls: ${msg.tool_calls.length}]` : '';
+      const toolCallIdInfo = msg.tool_call_id ? ` [tool_call_id: ${msg.tool_call_id}]` : '';
+      const nameInfo = msg.name ? ` [name: ${msg.name}]` : '';
+      console.log(`[Debug]   [${i}] ${msg.role}${toolCallsInfo}${toolCallIdInfo}${nameInfo}: ${contentPreview}...`);
+    }
+    console.log(`[Debug] =============================`);
+
     if (!model || !messages || !Array.isArray(messages)) {
       res.status(400).json({
         error: { message: 'Missing required fields: model, messages', type: 'invalid_request_error', code: 'invalid_parameter' },
@@ -412,6 +445,16 @@ export class OpenAIServer {
 
     let processedMessages = this.prepareMessagesWithTools(messages, tools, tool_choice);
 
+    // 调试：打印处理后的消息
+    console.log(`[Debug] 处理后的消息 (${processedMessages.length} 条):`);
+    for (let i = 0; i < processedMessages.length; i++) {
+      const msg = processedMessages[i];
+      const contentPreview = typeof msg.content === 'string' 
+        ? msg.content.substring(0, 100).replace(/\n/g, '\\n')
+        : (msg.content ? `[${typeof msg.content}]` : 'null');
+      console.log(`[Debug]   [${i}] ${msg.role}: ${contentPreview}...`);
+    }
+
     if (response_format && (response_format.type === 'json_object' || response_format.type === 'json_schema')) {
       const jsonInstruction = response_format.type === 'json_schema' && response_format.json_schema
         ? `You must respond with a JSON object that conforms to the following schema:\n${JSON.stringify(response_format.json_schema.schema || {}, null, 2)}`
@@ -436,7 +479,8 @@ export class OpenAIServer {
           stream_options?.include_usage, systemFingerprint,
         );
       } else {
-        const result = await this.openCodeClient.chat(processedMessages, { model });
+        const openCodeTools = (processedMessages as any).openCodeTools || {};
+        const result = await this.openCodeClient.chat(processedMessages, { model, tools: openCodeTools });
 
         const parsedToolCalls = tools ? this.parseToolCallsFromResponse(result.content) : null;
 
@@ -571,32 +615,31 @@ export class OpenAIServer {
 
     let fullText = '';
 
-    const onChunk = (delta: string) => {
-      fullText += delta;
-      const chunk: ChatCompletionChunk = {
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        system_fingerprint: fp,
-        choices: [{ index: 0, delta: { content: delta }, logprobs: null, finish_reason: null }],
-      };
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    };
-
-    const onReasoning = (delta: string) => {
-      const chunk: ChatCompletionChunk = {
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        system_fingerprint: fp,
-        choices: [{ index: 0, delta: { reasoning_content: delta }, logprobs: null, finish_reason: null }],
-      };
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    };
-
-    await this.openCodeClient.chatStream(messages, onChunk, { model }, onReasoning);
+    await this.openCodeClient.chatStream(messages, {
+      onChunk: (delta: string) => {
+        fullText += delta;
+        const chunk: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          system_fingerprint: fp,
+          choices: [{ index: 0, delta: { content: delta }, logprobs: null, finish_reason: null }],
+        };
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      },
+      onReasoning: (delta: string) => {
+        const chunk: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          system_fingerprint: fp,
+          choices: [{ index: 0, delta: { reasoning_content: delta }, logprobs: null, finish_reason: null }],
+        };
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      },
+    }, { model, tools: (messages as any).openCodeTools || {} });
 
     const finalChunk: ChatCompletionChunk = {
       id: completionId,
@@ -654,16 +697,33 @@ export class OpenAIServer {
     let fullText = '';
     let fullReasoning = '';
 
-    const onChunk = (delta: string) => {
-      fullText += delta;
-    };
-
-    const onReasoning = (delta: string) => {
-      fullReasoning += delta;
-    };
-
     try {
-      await this.openCodeClient.chatStream(messages, onChunk, { model }, onReasoning);
+      await this.openCodeClient.chatStream(messages, {
+        onChunk: (delta: string) => {
+          fullText += delta;
+          const chunk: ChatCompletionChunk = {
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            system_fingerprint: fp,
+            choices: [{ index: 0, delta: { content: delta }, logprobs: null, finish_reason: null }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        },
+        onReasoning: (delta: string) => {
+          fullReasoning += delta;
+          const chunk: ChatCompletionChunk = {
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            system_fingerprint: fp,
+            choices: [{ index: 0, delta: { reasoning_content: delta }, logprobs: null, finish_reason: null }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        },
+      }, { model, tools: (messages as any).openCodeTools || {} });
     } finally {
       clearInterval(keepAliveInterval);
     }
@@ -904,15 +964,17 @@ export class OpenAIServer {
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
 
-      await this.openCodeClient.chatStream(messages, (delta) => {
-        const chunk: CompletionChunk = {
-          id: completionId,
-          object: 'text_completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, text: delta, finish_reason: null }],
-        };
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      await this.openCodeClient.chatStream(messages, {
+        onChunk: (delta: string) => {
+          const chunk: CompletionChunk = {
+            id: completionId,
+            object: 'text_completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, text: delta, finish_reason: null }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        },
       }, { model });
 
       const finalChunk: CompletionChunk = {
@@ -998,37 +1060,38 @@ export class OpenAIServer {
 
   // ==================== 工具调用核心方法 ====================
 
-  private generateToolSystemPrompt(tools: ToolDefinition[], toolChoice?: ToolChoice): string {
-    const toolDescriptions = tools.map(tool => {
-      const fn = tool.function;
-      const params = fn.parameters
-        ? JSON.stringify(fn.parameters, null, 2)
-        : '{}';
-      return `### ${fn.name}\n${fn.description || ''}\nParameters:\n${params}`;
-    }).join('\n\n');
-
-    let choiceInstruction = '';
-    if (toolChoice === 'required') {
-      choiceInstruction = '\nYou MUST call at least one tool in your response. Do not respond with only text.';
-    } else if (typeof toolChoice === 'object' && toolChoice.type === 'function') {
-      choiceInstruction = `\nYou MUST call the function "${toolChoice.function.name}" in your response.`;
+  private mapTraeToolsToOpenCode(tools: ToolDefinition[]): Record<string, boolean> {
+    const openCodeTools: Record<string, boolean> = {};
+    
+    for (const tool of tools) {
+      const toolName = tool.function.name.toLowerCase();
+      
+      // Trae 工具名称映射到 OpenCode 内置工具
+      if (toolName.includes('read') || toolName.includes('file')) {
+        openCodeTools.read = true;
+      } else if (toolName.includes('write') || toolName.includes('edit')) {
+        openCodeTools.write = true;
+      } else if (toolName.includes('search') || toolName.includes('grep')) {
+        openCodeTools.codesearch = true;
+      } else if (toolName.includes('glob') || toolName.includes('find')) {
+        openCodeTools.glob = true;
+      } else if (toolName.includes('web') || toolName.includes('search')) {
+        openCodeTools.websearch = true;
+      } else if (toolName.includes('fetch') || toolName.includes('download')) {
+        openCodeTools.webfetch = true;
+      } else if (toolName.includes('weather')) {
+        openCodeTools.websearch = true; // 用 websearch 获取天气信息
+      } else if (toolName.includes('task') || toolName.includes('agent')) {
+        openCodeTools.task = true;
+      } else if (toolName.includes('todo') || toolName.includes('tasklist')) {
+        openCodeTools.todowrite = true;
+      } else {
+        // 默认启用 websearch
+        openCodeTools.websearch = true;
+      }
     }
-
-    return [
-      'You have access to the following tools:',
-      '',
-      toolDescriptions,
-      '',
-      `To call a tool, output a JSON block in the following format:`,
-      `${TOOL_CALL_OPEN_TAG}`,
-      `{"name": "function_name", "arguments": {"arg1": "value1", "arg2": "value2"}}`,
-      `${TOOL_CALL_CLOSE_TAG}`,
-      '',
-      `You can call multiple tools by using multiple ${TOOL_CALL_OPEN_TAG}/${TOOL_CALL_CLOSE_TAG} blocks.`,
-      'You may also include text before or after the tool calls.',
-      `If you do not need to call any tool, just respond normally without any ${TOOL_CALL_OPEN_TAG}/${TOOL_CALL_CLOSE_TAG} blocks.`,
-      choiceInstruction,
-    ].join('\n');
+    
+    return openCodeTools;
   }
 
   private prepareMessagesWithTools(
@@ -1041,27 +1104,27 @@ export class OpenAIServer {
       m => m.role === 'tool' || (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0)
     );
 
-    if (tools && tools.length > 0) {
-      const toolPrompt = this.generateToolSystemPrompt(tools, toolChoice);
-      const existingSystem = messages.find(m => m.role === 'system');
-      if (existingSystem) {
-        const systemContent = typeof existingSystem.content === 'string'
+    // 移除工具系统提示词注入，改为通过 OpenCode 的 tools 参数传递
+    const existingSystem = messages.find(m => m.role === 'system');
+    if (existingSystem) {
+      processed.push({
+        role: 'system',
+        content: typeof existingSystem.content === 'string'
           ? existingSystem.content
-          : this.extractTextFromContent(existingSystem.content);
-        processed.push({
-          role: 'system',
-          content: `${systemContent}\n\n${toolPrompt}`,
-        });
-      } else {
-        processed.push({ role: 'system', content: toolPrompt });
-      }
+          : this.extractTextFromContent(existingSystem.content),
+      });
     }
 
+    // 存储工具映射到消息的属性中，供后续使用
+    (processed as any).openCodeTools = tools ? this.mapTraeToolsToOpenCode(tools) : {};
+
     for (const msg of messages) {
-      if (tools && tools.length > 0 && msg.role === 'system') {
+      // 移除 system 消息的跳过逻辑，因为不再注入工具提示词
+      if (msg.role === 'system') {
         continue;
       }
 
+      // 处理 assistant 的 tool_calls — 始终处理（包括 Trae 内置工具场景）
       if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
         let content = '';
         if (msg.content && typeof msg.content === 'string' && msg.content.trim()) {
@@ -1072,6 +1135,7 @@ export class OpenAIServer {
         }
         processed.push({ role: 'assistant', content });
       } else if (msg.role === 'tool') {
+        // 处理 tool 结果 — 始终处理（包括 Trae 内置工具场景）
         const toolCallId = msg.tool_call_id || 'unknown';
         const toolName = msg.name || 'unknown';
         const resultContent = typeof msg.content === 'string'

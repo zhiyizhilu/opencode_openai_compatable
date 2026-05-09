@@ -426,6 +426,7 @@ export class OpenCodeClient {
     temperature?: number;
     agent?: string;
     system?: string;
+    tools?: Array<{ type: string; function: { name: string; description?: string; parameters?: any } }>;
   } = {}): Promise<{ content: string; reasoning?: string }> {
     await this.ensureStarted();
 
@@ -518,6 +519,9 @@ export class OpenCodeClient {
       };
     } catch (err: any) {
       this.httpClient.delete(`/session/${sessionId}`).catch(() => {});
+      if (err.response?.data) {
+        console.error('[OpenCode] 错误响应:', JSON.stringify(err.response.data, null, 2).substring(0, 500));
+      }
       throw err;
     }
   }
@@ -528,14 +532,22 @@ export class OpenCodeClient {
    */
   async chatStream(
     messages: Array<{ role: string; content: string | any[] | null }>,
-    onChunk: (text: string) => void,
+    callbacks: {
+      onChunk?: (text: string) => void;
+      onReasoning?: (text: string) => void;
+      onReasoningComplete?: (text: string) => void;
+      onTodo?: (todos: Array<{ id: string; content: string; status: string; priority: string }>) => void;
+      onTool?: (tool: { name: string; status: string; output?: string; error?: string }) => void;
+      onStepStart?: (reason?: string) => void;
+      onStepFinish?: (reason: string) => void;
+    },
     options: {
       model?: string;
       temperature?: number;
       agent?: string;
       system?: string;
+      tools?: Array<{ type: string; function: { name: string; description?: string; parameters?: any } }>;
     } = {},
-    onReasoning?: (text: string) => void,
   ): Promise<string> {
     await this.ensureStarted();
 
@@ -594,11 +606,6 @@ export class OpenCodeClient {
 
         // 监听消息相关事件
         // OpenCode SSE 事件格式: { type: string, properties: { ... } }
-        // 关键事件类型:
-        //   message.part.delta  - 流式增量文本 { sessionID, messageID, partID, field: "text", delta: "增量文本" }
-        //   message.part.updated - 文本部分完整更新 { sessionID, part: { type, text, ... } }
-        //   session.idle         - 会话完成
-        //   session.status       - 会话状态变化 { status: { type: "busy"|"idle" } }
         eventSource.on('event', (event: any) => {
           const props = event.properties || {};
 
@@ -608,11 +615,11 @@ export class OpenCodeClient {
           // 流式增量文本事件（真正的 token-by-token 推送）
           if (event.type === 'message.part.delta' && props.field === 'text' && props.delta) {
             const partType = props.partType || 'text';
-            if (partType === 'reasoning' && onReasoning) {
-              onReasoning(props.delta);
+            if (partType === 'reasoning' && callbacks.onReasoning) {
+              callbacks.onReasoning(props.delta);
             } else {
               fullText += props.delta;
-              onChunk(props.delta);
+              callbacks.onChunk?.(props.delta);
             }
           }
 
@@ -621,21 +628,43 @@ export class OpenCodeClient {
             if (part?.type === 'text' && part?.text) {
               if (!fullText) {
                 fullText = part.text;
-                onChunk(part.text);
+                callbacks.onChunk?.(part.text);
               } else if (part.text.length > fullText.length && part.text.startsWith(fullText)) {
                 const delta = part.text.slice(fullText.length);
                 fullText = part.text;
-                onChunk(delta);
+                callbacks.onChunk?.(delta);
               }
             }
-            if (part?.type === 'reasoning' && part?.text && onReasoning) {
-              onReasoning(part.text);
+            if (part?.type === 'reasoning' && part?.text) {
+              callbacks.onReasoningComplete?.(part.text);
             }
-            if (part?.type === 'tool' && part?.state?.status === 'completed' && part?.state?.output) {
-              const toolInfo = `\n[Tool: ${part.tool || 'unknown'}] ${part.state.output}\n`;
-              fullText += toolInfo;
-              onChunk(toolInfo);
+            if (part?.type === 'tool' && part?.state) {
+              const state = part.state;
+              const toolData = {
+                name: part.tool || 'unknown',
+                status: state.status,
+                output: state.status === 'completed' ? state.output : undefined,
+                error: state.status === 'error' ? state.error : undefined,
+              };
+              callbacks.onTool?.(toolData);
+              if (state.status === 'completed' && state.output) {
+                const toolInfo = `\n[Tool: ${part.tool || 'unknown'}] ${state.output}\n`;
+                fullText += toolInfo;
+                callbacks.onChunk?.(toolInfo);
+              }
             }
+          }
+
+          if (event.type === 'todo.updated' && props.todos) {
+            callbacks.onTodo?.(props.todos);
+          }
+
+          if (event.type === 'message.part.updated' && props.part?.type === 'step-start') {
+            callbacks.onStepStart?.(props.part.snapshot);
+          }
+
+          if (event.type === 'message.part.updated' && props.part?.type === 'step-finish') {
+            callbacks.onStepFinish?.(props.part.reason);
           }
 
           // 会话空闲 = 完成

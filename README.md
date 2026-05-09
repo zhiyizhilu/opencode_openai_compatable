@@ -11,7 +11,7 @@
   - `GET /v1/models/:model` - 获取模型详情
   - `POST /v1/completions` - 文本补全（支持流式）
 - **真正的流式响应**：通过 OpenCode 的 SSE 事件流实现实时推送，SSE 失败时自动回退到伪流式
-- **Tool/Function Calling**：支持 OpenAI 格式的 `tools` 和 `tool_choice` 参数（`none` / `auto` / `required` / 指定函数），通过 `«tool_call»` / `«/tool_call»` 标签实现工具调用协议
+- **Tool/Function Calling**：支持 OpenAI 格式的 `tools` 和 `tool_choice` 参数（`none` / `auto` / `required` / 指定函数），通过 `<tool_call]` / `[/tool_call>` 标签实现工具调用协议
 - **思考链（Reasoning）内容**：支持 `reasoning_content` 字段，在流式和非流式响应中回传模型的思考过程
 - **`response_format` 支持**：支持 `json_object` 和 `json_schema` 两种响应格式，自动注入 JSON Schema 指令到系统消息
 - **多模态消息内容支持**：兼容 OpenAI 数组格式的消息内容（`content: string | any[]`），自动提取文本部分
@@ -298,7 +298,7 @@ npm start -- --cors "http://localhost:5173,https://app.example.com"
 ```
 opencode/
 ├── opencode-client.ts              # OpenCode 原生客户端（SSE 流式、认证、会话管理、模型列表）
-├── opencode-openai-server.ts       # OpenAI 兼容服务器（流式 + 回退 + Tool Calling + 12 个端点）
+├── opencode-openai-server.ts       # OpenAI 兼容服务器（流式 + 回退 + Tool Calling + 8 个端点）
 ├── opencode-openai-server-cli.ts   # CLI 启动脚本（Commander，完整参数支持）
 ├── test.ts                         # 集成测试脚本（8 个测试用例）
 ├── package.json                    # 项目配置（Express + Axios + Commander）
@@ -325,7 +325,7 @@ opencode/
 7. 如果启用了 OpenCode 认证，请通过 `--username` 和 `--password` 或环境变量提供凭据
 8. 消息内容支持字符串和数组两种格式，兼容 OpenAI 多模态消息结构
 9. `dist/` 目录是 TypeScript 编译产物，运行集成测试前需执行 `npm run build`
-10. 工具调用使用 `«tool_call»` / `«/tool_call»` 标签包裹 JSON 格式的函数调用请求
+10. 工具调用使用 `<tool_call]` / `[/tool_call>` 标签包裹 JSON 格式的函数调用请求
 
 ## 故障排除
 
