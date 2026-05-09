@@ -43,15 +43,59 @@ interface ChatMessage {
 
 type ToolChoice = 'none' | 'auto' | 'required' | { type: 'function'; function: { name: string } };
 
+interface StreamOptions {
+  include_usage?: boolean;
+}
+
+interface ResponseFormat {
+  type?: 'text' | 'json_object' | 'json_schema';
+  json_schema?: {
+    name: string;
+    schema?: Record<string, any>;
+    strict?: boolean;
+  };
+}
+
+interface Logprobs {
+  content: Array<{
+    token: string;
+    logprob: number;
+    bytes: number[] | null;
+    top_logprobs: Array<{
+      token: string;
+      logprob: number;
+      bytes: number[] | null;
+    }> | null;
+  }> | null;
+  refusal: Array<{
+    token: string;
+    logprob: number;
+    bytes: number[] | null;
+    top_logprobs: Array<{
+      token: string;
+      logprob: number;
+      bytes: number[] | null;
+    }> | null;
+  }> | null;
+}
+
 interface ChatCompletionRequest {
   model: string;
   messages: ChatMessage[];
   temperature?: number;
   max_tokens?: number;
+  max_completion_tokens?: number;
   stream?: boolean;
+  stream_options?: StreamOptions;
   top_p?: number;
   frequency_penalty?: number;
   presence_penalty?: number;
+  n?: number;
+  stop?: string | string[];
+  response_format?: ResponseFormat;
+  seed?: number;
+  logprobs?: boolean;
+  top_logprobs?: number;
   tools?: ToolDefinition[];
   tool_choice?: ToolChoice;
 }
@@ -61,14 +105,17 @@ interface ChatCompletionResponse {
   object: 'chat.completion';
   created: number;
   model: string;
+  system_fingerprint: string;
   choices: Array<{
     index: number;
     message: {
       role: 'assistant';
       content: string | null;
       reasoning_content?: string | null;
+      refusal?: string | null;
       tool_calls?: ToolCall[];
     };
+    logprobs: Logprobs | null;
     finish_reason: 'stop' | 'length' | 'content_filter' | 'tool_calls';
   }>;
   usage: {
@@ -78,6 +125,9 @@ interface ChatCompletionResponse {
     completion_tokens_details?: {
       reasoning_tokens?: number;
     };
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
   };
 }
 
@@ -86,16 +136,30 @@ interface ChatCompletionChunk {
   object: 'chat.completion.chunk';
   created: number;
   model: string;
+  system_fingerprint: string;
   choices: Array<{
     index: number;
     delta: {
       role?: 'assistant';
       content?: string | null;
       reasoning_content?: string | null;
+      refusal?: string | null;
       tool_calls?: ToolCallDelta[];
     };
+    logprobs: Logprobs | null;
     finish_reason: 'stop' | 'length' | 'content_filter' | 'tool_calls' | null;
   }>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    completion_tokens_details?: {
+      reasoning_tokens?: number;
+    };
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
+  };
 }
 
 interface Model {
@@ -307,7 +371,11 @@ export class OpenAIServer {
   // ==================== Chat Completions ====================
 
   private async chatCompletions(req: Request, res: Response): Promise<void> {
-    const { model, messages, stream = false, tools, tool_choice } = req.body as ChatCompletionRequest;
+    const {
+      model, messages, stream = false, tools, tool_choice,
+      n = 1, stop, response_format, seed, logprobs: requestLogprobs,
+      top_logprobs, stream_options, max_completion_tokens,
+    } = req.body as ChatCompletionRequest;
 
     if (!model || !messages || !Array.isArray(messages)) {
       res.status(400).json({
@@ -315,6 +383,8 @@ export class OpenAIServer {
       });
       return;
     }
+
+    const systemFingerprint = `fp_${this.hashString(model + Date.now()).substr(0, 12)}`;
 
     if (tool_choice === 'none') {
       const completionId = `chatcmpl-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -324,9 +394,11 @@ export class OpenAIServer {
         object: 'chat.completion',
         created,
         model,
+        system_fingerprint: systemFingerprint,
         choices: [{
           index: 0,
           message: { role: 'assistant', content: '' },
+          logprobs: null,
           finish_reason: 'stop',
         }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
@@ -338,15 +410,37 @@ export class OpenAIServer {
     const completionId = `chatcmpl-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const created = Math.floor(Date.now() / 1000);
 
-    const processedMessages = this.prepareMessagesWithTools(messages, tools, tool_choice);
+    let processedMessages = this.prepareMessagesWithTools(messages, tools, tool_choice);
+
+    if (response_format && (response_format.type === 'json_object' || response_format.type === 'json_schema')) {
+      const jsonInstruction = response_format.type === 'json_schema' && response_format.json_schema
+        ? `You must respond with a JSON object that conforms to the following schema:\n${JSON.stringify(response_format.json_schema.schema || {}, null, 2)}`
+        : 'You must respond with a valid JSON object. Do not include any text outside the JSON object.';
+      const existingSystem = processedMessages.find(m => m.role === 'system');
+      if (existingSystem) {
+        const systemContent = typeof existingSystem.content === 'string'
+          ? existingSystem.content
+          : this.extractTextFromContent(existingSystem.content);
+        processedMessages = processedMessages.map(m =>
+          m.role === 'system' ? { ...m, content: `${systemContent}\n\n${jsonInstruction}` } : m
+        );
+      } else {
+        processedMessages = [{ role: 'system', content: jsonInstruction }, ...processedMessages];
+      }
+    }
 
     try {
       if (stream) {
-        await this.streamChatCompletion(req, res, completionId, created, model, processedMessages, tools);
+        await this.streamChatCompletion(
+          req, res, completionId, created, model, processedMessages, tools,
+          stream_options?.include_usage, systemFingerprint,
+        );
       } else {
         const result = await this.openCodeClient.chat(processedMessages, { model });
 
         const parsedToolCalls = tools ? this.parseToolCallsFromResponse(result.content) : null;
+
+        const numChoices = Math.min(n, 1);
 
         if (parsedToolCalls && parsedToolCalls.length > 0) {
           const textContent = this.extractTextOutsideToolCalls(result.content);
@@ -355,6 +449,7 @@ export class OpenAIServer {
             object: 'chat.completion',
             created,
             model,
+            system_fingerprint: systemFingerprint,
             choices: [{
               index: 0,
               message: {
@@ -363,6 +458,7 @@ export class OpenAIServer {
                 reasoning_content: result.reasoning || null,
                 tool_calls: parsedToolCalls,
               },
+              logprobs: null,
               finish_reason: 'tool_calls',
             }],
             usage: {
@@ -381,6 +477,7 @@ export class OpenAIServer {
             object: 'chat.completion',
             created,
             model,
+            system_fingerprint: systemFingerprint,
             choices: [{
               index: 0,
               message: {
@@ -388,6 +485,7 @@ export class OpenAIServer {
                 content: result.content,
                 reasoning_content: result.reasoning || null,
               },
+              logprobs: null,
               finish_reason: 'stop',
             }],
             usage: {
@@ -420,13 +518,15 @@ export class OpenAIServer {
     model: string,
     messages: ChatMessage[],
     tools?: ToolDefinition[],
+    includeUsage?: boolean,
+    systemFingerprint?: string,
   ): Promise<void> {
     try {
-      await this.streamChatViaSSE(req, res, completionId, created, model, messages, tools);
+      await this.streamChatViaSSE(req, res, completionId, created, model, messages, tools, includeUsage, systemFingerprint);
     } catch (sseError: any) {
       console.warn('[OpenAI Server] SSE \u6D41\u5F0F\u5931\u8D25\uFF0C\u56DE\u9000\u5230\u4F2A\u6D41\u5F0F:', sseError.message);
       if (!res.headersSent) {
-        await this.streamChatFallback(req, res, completionId, created, model, messages, tools);
+        await this.streamChatFallback(req, res, completionId, created, model, messages, tools, includeUsage, systemFingerprint);
       }
     }
   }
@@ -439,18 +539,23 @@ export class OpenAIServer {
     model: string,
     messages: ChatMessage[],
     tools?: ToolDefinition[],
+    includeUsage?: boolean,
+    systemFingerprint?: string,
   ): Promise<void> {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
+    const fp = systemFingerprint || `fp_${this.hashString(model).substr(0, 12)}`;
+
     const roleChunk: ChatCompletionChunk = {
       id: completionId,
       object: 'chat.completion.chunk',
       created,
       model,
-      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+      system_fingerprint: fp,
+      choices: [{ index: 0, delta: { role: 'assistant' }, logprobs: null, finish_reason: null }],
     };
     res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
@@ -463,7 +568,8 @@ export class OpenAIServer {
         object: 'chat.completion.chunk',
         created,
         model,
-        choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+        system_fingerprint: fp,
+        choices: [{ index: 0, delta: { content: delta }, logprobs: null, finish_reason: null }],
       };
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     };
@@ -474,7 +580,8 @@ export class OpenAIServer {
         object: 'chat.completion.chunk',
         created,
         model,
-        choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }],
+        system_fingerprint: fp,
+        choices: [{ index: 0, delta: { reasoning_content: delta }, logprobs: null, finish_reason: null }],
       };
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     };
@@ -491,6 +598,7 @@ export class OpenAIServer {
             object: 'chat.completion.chunk',
             created,
             model,
+            system_fingerprint: fp,
             choices: [{
               index: 0,
               delta: {
@@ -501,6 +609,7 @@ export class OpenAIServer {
                   function: { name: tc.function.name, arguments: tc.function.arguments },
                 }],
               },
+              logprobs: null,
               finish_reason: null,
             }],
           };
@@ -511,7 +620,8 @@ export class OpenAIServer {
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+          system_fingerprint: fp,
+          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'tool_calls' }],
         };
         res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       } else {
@@ -520,7 +630,15 @@ export class OpenAIServer {
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          system_fingerprint: fp,
+          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
+          ...(includeUsage ? {
+            usage: {
+              prompt_tokens: this.estimateTokens(messages),
+              completion_tokens: this.estimateTokens([{ role: 'assistant', content: fullText }]),
+              total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: fullText }]),
+            },
+          } : {}),
         };
         res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       }
@@ -530,7 +648,15 @@ export class OpenAIServer {
         object: 'chat.completion.chunk',
         created,
         model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        system_fingerprint: fp,
+        choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
+        ...(includeUsage ? {
+          usage: {
+            prompt_tokens: this.estimateTokens(messages),
+            completion_tokens: this.estimateTokens([{ role: 'assistant', content: fullText }]),
+            total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: fullText }]),
+          },
+        } : {}),
       };
       res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
     }
@@ -547,8 +673,12 @@ export class OpenAIServer {
     model: string,
     messages: ChatMessage[],
     tools?: ToolDefinition[],
+    includeUsage?: boolean,
+    systemFingerprint?: string,
   ): Promise<void> {
     const result = await this.openCodeClient.chat(messages, { model });
+
+    const fp = systemFingerprint || `fp_${this.hashString(model).substr(0, 12)}`;
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -560,7 +690,8 @@ export class OpenAIServer {
       object: 'chat.completion.chunk',
       created,
       model,
-      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+      system_fingerprint: fp,
+      choices: [{ index: 0, delta: { role: 'assistant' }, logprobs: null, finish_reason: null }],
     };
     res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
@@ -572,7 +703,8 @@ export class OpenAIServer {
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }],
+          system_fingerprint: fp,
+          choices: [{ index: 0, delta: { reasoning_content: chunk }, logprobs: null, finish_reason: null }],
         };
         res.write(`data: ${JSON.stringify(data)}\n\n`);
         await this.delay(30);
@@ -586,7 +718,8 @@ export class OpenAIServer {
         object: 'chat.completion.chunk',
         created,
         model,
-        choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
+        system_fingerprint: fp,
+        choices: [{ index: 0, delta: { content: chunk }, logprobs: null, finish_reason: null }],
       };
       res.write(`data: ${JSON.stringify(data)}\n\n`);
       await this.delay(30);
@@ -602,6 +735,7 @@ export class OpenAIServer {
             object: 'chat.completion.chunk',
             created,
             model,
+            system_fingerprint: fp,
             choices: [{
               index: 0,
               delta: {
@@ -612,6 +746,7 @@ export class OpenAIServer {
                   function: { name: tc.function.name, arguments: tc.function.arguments },
                 }],
               },
+              logprobs: null,
               finish_reason: null,
             }],
           };
@@ -622,7 +757,8 @@ export class OpenAIServer {
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+          system_fingerprint: fp,
+          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'tool_calls' }],
         };
         res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       } else {
@@ -631,7 +767,15 @@ export class OpenAIServer {
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          system_fingerprint: fp,
+          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
+          ...(includeUsage ? {
+            usage: {
+              prompt_tokens: this.estimateTokens(messages),
+              completion_tokens: this.estimateTokens([{ role: 'assistant', content: result.content }]),
+              total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: result.content }]),
+            },
+          } : {}),
         };
         res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       }
@@ -641,7 +785,15 @@ export class OpenAIServer {
         object: 'chat.completion.chunk',
         created,
         model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        system_fingerprint: fp,
+        choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: 'stop' }],
+        ...(includeUsage ? {
+          usage: {
+            prompt_tokens: this.estimateTokens(messages),
+            completion_tokens: this.estimateTokens([{ role: 'assistant', content: result.content }]),
+            total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: result.content }]),
+          },
+        } : {}),
       };
       res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
     }
@@ -992,6 +1144,16 @@ export class OpenAIServer {
   }
 
   // ==================== 通用工具方法 ====================
+
+  private hashString(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return Math.abs(hash).toString(36);
+  }
 
   private splitIntoChunks(text: string, chunkSize: number): string[] {
     const chunks: string[] = [];
