@@ -1,4 +1,4 @@
-﻿# OpenAI 兼容的 OpenCode API 服务器
+﻿# OpenAI 兼容的 OpenCode API 服务器 v2.0
 
 将 OpenCode 本地服务转换为 OpenAI 兼容的 REST API，支持所有主要的 OpenAI API 端点。
 
@@ -11,10 +11,14 @@
   - `GET /v1/models/:model` - 获取模型详情
   - `POST /v1/completions` - 文本补全（支持流式）
 - **真正的流式响应**：通过 OpenCode 的 SSE 事件流实现实时推送，SSE 失败时自动回退到伪流式
+- **Tool/Function Calling**：支持 OpenAI 格式的 `tools` 和 `tool_choice` 参数，自动转换为 OpenCode 工具调用协议
+- **多模态消息内容支持**：兼容 OpenAI 数组格式的消息内容（`content: string | any[]`），自动提取文本部分
+- **代理选择**：支持通过 `agent` 参数选择 OpenCode 的不同代理
+- **全局 CLI 安装**：支持通过 `npm install -g` 全局安装为命令行工具
 - 支持 OpenCode 服务器认证（Basic Auth）
 - 自动模型映射
 - CORS 支持
-- 额外的 OpenCode 代理端点（`/opencode/agents`、`/opencode/config`）
+- 额外的 OpenCode 代理端点（`/opencode/health`、`/opencode/agents`、`/opencode/config`）
 - 请求日志
 - 错误处理和优雅降级
 
@@ -122,7 +126,19 @@ curl -X POST http://127.0.0.1:4094/v1/chat/completions \
   }'
 ```
 
-### 4. 文本补全
+### 4. 指定代理
+
+```bash
+curl -X POST http://127.0.0.1:4094/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/gpt-5-nano",
+    "messages": [{"role": "user", "content": "分析这段代码"}],
+    "agent": "code-analysis"
+  }'
+```
+
+### 5. 文本补全
 
 ```bash
 curl -X POST http://127.0.0.1:4094/v1/completions \
@@ -132,6 +148,13 @@ curl -X POST http://127.0.0.1:4094/v1/completions \
     "prompt": "你好，请用一句话介绍你自己",
     "temperature": 0.7
   }'
+```
+
+### 6. 运行测试
+
+```bash
+# 启动服务器后，运行集成测试
+npm test
 ```
 
 ## 使用 OpenAI SDK
@@ -184,14 +207,14 @@ main();
 
 ## 可用模型
 
-服务会自动从 OpenCode 获取可用模型列表，常见的免费模型包括：
+服务会自动从 OpenCode 获取可用模型列表，以下为常见的免费模型示例（实际列表以 OpenCode 返回为准）：
 
-- `opencode/gpt-5-nano`
 - `opencode/mimo-v2-omni-free`
 - `opencode/mimo-v2-pro-free`
 - `opencode/minimax-m2.5-free`
 - `opencode/nemotron-3-super-free`
 - `opencode/big-pickle`
+- `opencode/gpt-5-nano`
 
 ## 命令行参数
 
@@ -258,22 +281,34 @@ opencode/
 ├── opencode-client.ts              # OpenCode 原始客户端（支持 SSE 流式、认证）
 ├── opencode-openai-server.ts       # OpenAI 兼容服务器（真正流式 + 伪流式回退）
 ├── opencode-openai-server-cli.ts   # CLI 启动脚本（完整参数支持）
-├── test.ts                         # 测试脚本
+├── test.ts                         # 集成测试脚本
 ├── package.json                    # 项目配置
 ├── tsconfig.json                   # TypeScript 配置
 ├── start-server.bat                # Windows 启动脚本
+├── 服务器 _ OpenCode.md             # OpenCode 原生服务 API 参考文档
+├── dist/                           # TypeScript 编译输出
+│   ├── opencode-client.js
+│   ├── opencode-client.d.ts
+│   ├── opencode-openai-server.js
+│   ├── opencode-openai-server.d.ts
+│   ├── opencode-openai-server-cli.js
+│   ├── opencode-openai-server-cli.d.ts
+│   ├── test.js
+│   └── test.d.ts
+├── .gitignore                      # Git 忽略规则
 └── README.md                       # 本文件
 ```
 
 ## 注意事项
 
-1. 确保 OpenCode CLI 已正确安装并可用
+1. 确保 OpenCode CLI 已正确安装并可用（`npm install -g opencode-ai`）
 2. **端口 4094** 是对外提供 OpenAI 兼容 API 的入口；如需更改，使用 `-p` 参数
 3. **端口 4095** 是 OpenCode 原生服务的内部端口（由 `opencode serve` 启动）；如需更改，使用 `--opencode-port` 参数
 4. 两个端口不能相同
 5. 流式响应优先使用 SSE 事件流实现真正的实时推送，失败时自动回退到伪流式
 6. 不需要真实的 API key，可以使用任意字符串
 7. 如果启用了 OpenCode 认证，请通过 `--username` 和 `--password` 或环境变量提供凭据
+8. 消息内容支持字符串和数组两种格式，兼容 OpenAI 多模态消息结构
 
 ## 故障排除
 
@@ -314,3 +349,6 @@ npm start -- -c /path/to/opencode
 ## 许可证
 
 MIT
+
+
+

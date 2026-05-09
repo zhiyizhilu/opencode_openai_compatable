@@ -1,6 +1,6 @@
 {
   "name": "opencode-openai-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "OpenAI 兼容的 OpenCode API 服务器",
   "main": "dist/opencode-openai-server-cli.js",
   "bin": {

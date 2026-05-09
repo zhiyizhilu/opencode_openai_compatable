@@ -370,7 +370,8 @@ export class OpenCodeClient {
   /**
    * 从消息内容中提取纯文本
    */
-  private extractTextContent(content: string | any[]): string {
+  private extractTextContent(content: string | any[] | null): string {
+    if (!content) return '';
     if (typeof content === 'string') {
       return content;
     }
@@ -383,16 +384,49 @@ export class OpenCodeClient {
     return String(content || '');
   }
 
+  private buildMessageTextFromHistory(messages: Array<{ role: string; content: string | any[] | null }>): string {
+    const nonSystemMessages = messages.filter(m => m.role !== 'system');
+
+    if (nonSystemMessages.length === 0) {
+      return '';
+    }
+
+    const onlyUserMessages = nonSystemMessages.filter(m => m.role === 'user');
+    if (nonSystemMessages.length === 1 && onlyUserMessages.length === 1) {
+      return this.extractTextContent(onlyUserMessages[0].content);
+    }
+
+    const parts: string[] = [];
+    for (const msg of nonSystemMessages) {
+      const text = this.extractTextContent(msg.content);
+      if (!text) continue;
+
+      switch (msg.role) {
+        case 'user':
+          parts.push(`[User]: ${text}`);
+          break;
+        case 'assistant':
+          parts.push(`[Assistant]: ${text}`);
+          break;
+        default:
+          parts.push(`[${msg.role}]: ${text}`);
+          break;
+      }
+    }
+
+    return parts.join('\n\n');
+  }
+
   /**
    * 发送聊天消息（非流式）
    * 流程：创建会话 -> 发送消息 -> 提取回复 -> 清理会话
    */
-  async chat(messages: Array<{ role: string; content: string | any[] }>, options: {
+  async chat(messages: Array<{ role: string; content: string | any[] | null }>, options: {
     model?: string;
     temperature?: number;
     agent?: string;
     system?: string;
-  } = {}): Promise<string> {
+  } = {}): Promise<{ content: string; reasoning?: string }> {
     await this.ensureStarted();
 
     // 创建新会话
@@ -409,23 +443,15 @@ export class OpenCodeClient {
     }
 
     try {
-      // 取最后一条用户消息
-      const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
-      if (!lastUserMessage) {
-        throw new Error('没有用户消息可发送');
-      }
-
-      const textContent = this.extractTextContent(lastUserMessage.content);
+      const textContent = this.buildMessageTextFromHistory(messages);
       if (!textContent) {
-        throw new Error('用户消息内容为空');
+        throw new Error('没有可发送的消息内容');
       }
 
-      // 构建消息体
       const messageBody: any = {
         parts: [{ type: 'text', text: textContent }],
       };
 
-      // 传递 system 消息
       const systemMessage = options.system || messages.find(m => m.role === 'system');
       if (systemMessage) {
         messageBody.system = typeof systemMessage === 'string' ? systemMessage : this.extractTextContent(
@@ -433,7 +459,6 @@ export class OpenCodeClient {
         );
       }
 
-      // 传递模型
       if (options.model && options.model !== 'auto') {
         const parts = options.model.split('/');
         if (parts.length >= 2) {
@@ -441,7 +466,6 @@ export class OpenCodeClient {
         }
       }
 
-      // 传递代理
       if (options.agent) {
         messageBody.agent = options.agent;
       }
@@ -459,15 +483,37 @@ export class OpenCodeClient {
         .map((p: any) => p.text)
         .join('');
 
-      if (!replyText) {
+      const reasoningText = parts
+        .filter((p: any) => p.type === 'reasoning' && p.text)
+        .map((p: any) => p.text)
+        .join('\n');
+
+      if (!replyText && !reasoningText) {
+        const toolParts = parts.filter((p: any) => p.type === 'tool');
+        if (toolParts.length > 0) {
+          const toolTexts = toolParts.map((p: any) => {
+            const state = p.state || {};
+            const toolName = p.tool || 'unknown';
+            if (state.status === 'completed' && state.output) {
+              return `[Tool: ${toolName}] ${state.output}`;
+            }
+            if (state.status === 'error' && state.error) {
+              return `[Tool Error: ${toolName}] ${state.error}`;
+            }
+            return `[Tool: ${toolName}] ${state.status || 'unknown'}`;
+          });
+          return { content: toolTexts.join('\n\n') };
+        }
         console.error('[OpenCode] parts 数据:', JSON.stringify(parts).substring(0, 300));
         throw new Error('OpenCode 返回内容为空');
       }
 
-      // 异步清理会话
       this.httpClient.delete(`/session/${sessionId}`).catch(() => {});
 
-      return replyText;
+      return {
+        content: replyText || '',
+        reasoning: reasoningText || undefined,
+      };
     } catch (err: any) {
       this.httpClient.delete(`/session/${sessionId}`).catch(() => {});
       throw err;
@@ -479,14 +525,15 @@ export class OpenCodeClient {
    * 流程：创建会话 -> 订阅事件流 -> 异步发送消息 -> 实时接收事件 -> 清理
    */
   async chatStream(
-    messages: Array<{ role: string; content: string | any[] }>,
+    messages: Array<{ role: string; content: string | any[] | null }>,
     onChunk: (text: string) => void,
     options: {
       model?: string;
       temperature?: number;
       agent?: string;
       system?: string;
-    } = {}
+    } = {},
+    onReasoning?: (text: string) => void,
   ): Promise<string> {
     await this.ensureStarted();
 
@@ -504,18 +551,11 @@ export class OpenCodeClient {
     }
 
     try {
-      // 取最后一条用户消息
-      const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
-      if (!lastUserMessage) {
-        throw new Error('没有用户消息可发送');
-      }
-
-      const textContent = this.extractTextContent(lastUserMessage.content);
+      const textContent = this.buildMessageTextFromHistory(messages);
       if (!textContent) {
-        throw new Error('用户消息内容为空');
+        throw new Error('没有可发送的消息内容');
       }
 
-      // 构建消息体
       const messageBody: any = {
         parts: [{ type: 'text', text: textContent }],
       };
@@ -538,7 +578,6 @@ export class OpenCodeClient {
         messageBody.agent = options.agent;
       }
 
-      // 订阅 SSE 事件流
       const eventSource = this.subscribeEvents();
 
       return new Promise<string>((resolve, reject) => {
@@ -566,24 +605,34 @@ export class OpenCodeClient {
 
           // 流式增量文本事件（真正的 token-by-token 推送）
           if (event.type === 'message.part.delta' && props.field === 'text' && props.delta) {
-            fullText += props.delta;
-            onChunk(props.delta);
+            const partType = props.partType || 'text';
+            if (partType === 'reasoning' && onReasoning) {
+              onReasoning(props.delta);
+            } else {
+              fullText += props.delta;
+              onChunk(props.delta);
+            }
           }
 
-          // 文本部分完整更新事件（备用，用于兜底获取完整文本）
           if (event.type === 'message.part.updated') {
             const part = props.part;
             if (part?.type === 'text' && part?.text) {
-              // 如果还没有收到过 delta 事件，用 updated 事件作为增量源
               if (!fullText) {
                 fullText = part.text;
                 onChunk(part.text);
               } else if (part.text.length > fullText.length && part.text.startsWith(fullText)) {
-                // 部分文本比已收到的长，取增量
                 const delta = part.text.slice(fullText.length);
                 fullText = part.text;
                 onChunk(delta);
               }
+            }
+            if (part?.type === 'reasoning' && part?.text && onReasoning) {
+              onReasoning(part.text);
+            }
+            if (part?.type === 'tool' && part?.state?.status === 'completed' && part?.state?.output) {
+              const toolInfo = `\n[Tool: ${part.tool || 'unknown'}] ${part.state.output}\n`;
+              fullText += toolInfo;
+              onChunk(toolInfo);
             }
           }
 

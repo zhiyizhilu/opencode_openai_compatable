@@ -3,10 +3,45 @@ import { OpenCodeClient } from './opencode-client';
 
 // ==================== 类型定义 ====================
 
-interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string | any[];
+interface FunctionDefinition {
+  name: string;
+  description?: string;
+  parameters?: Record<string, any>;
 }
+
+interface ToolDefinition {
+  type: 'function';
+  function: FunctionDefinition;
+}
+
+interface ToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+interface ToolCallDelta {
+  index: number;
+  id?: string;
+  type?: 'function';
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+}
+
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | any[] | null;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  name?: string;
+}
+
+type ToolChoice = 'none' | 'auto' | 'required' | { type: 'function'; function: { name: string } };
 
 interface ChatCompletionRequest {
   model: string;
@@ -17,6 +52,8 @@ interface ChatCompletionRequest {
   top_p?: number;
   frequency_penalty?: number;
   presence_penalty?: number;
+  tools?: ToolDefinition[];
+  tool_choice?: ToolChoice;
 }
 
 interface ChatCompletionResponse {
@@ -28,14 +65,19 @@ interface ChatCompletionResponse {
     index: number;
     message: {
       role: 'assistant';
-      content: string;
+      content: string | null;
+      reasoning_content?: string | null;
+      tool_calls?: ToolCall[];
     };
-    finish_reason: 'stop' | 'length' | 'content_filter';
+    finish_reason: 'stop' | 'length' | 'content_filter' | 'tool_calls';
   }>;
   usage: {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    completion_tokens_details?: {
+      reasoning_tokens?: number;
+    };
   };
 }
 
@@ -48,9 +90,11 @@ interface ChatCompletionChunk {
     index: number;
     delta: {
       role?: 'assistant';
-      content?: string;
+      content?: string | null;
+      reasoning_content?: string | null;
+      tool_calls?: ToolCallDelta[];
     };
-    finish_reason: 'stop' | 'length' | 'content_filter' | null;
+    finish_reason: 'stop' | 'length' | 'content_filter' | 'tool_calls' | null;
   }>;
 }
 
@@ -116,6 +160,9 @@ interface OpenAIServerOptions {
   password?: string;
 }
 
+const TOOL_CALL_OPEN_TAG = '\u276Etool_call\u276F';
+const TOOL_CALL_CLOSE_TAG = '\u276E/tool_call\u276F';
+
 // ==================== 服务器 ====================
 
 export class OpenAIServer {
@@ -142,10 +189,8 @@ export class OpenAIServer {
   private setupMiddleware(corsOrigins: string[]): void {
     this.app.use(express.json({ limit: '10mb' }));
 
-    // CORS 中间件
     this.app.use((req, res, next) => {
       const origin = req.headers.origin;
-      // 默认允许所有来源，额外允许配置的来源
       if (origin && corsOrigins.length > 0) {
         if (corsOrigins.includes(origin) || corsOrigins.includes('*')) {
           res.header('Access-Control-Allow-Origin', origin);
@@ -162,7 +207,6 @@ export class OpenAIServer {
       }
     });
 
-    // 请求日志
     this.app.use((req, res, next) => {
       const start = Date.now();
       res.on('finish', () => {
@@ -176,16 +220,13 @@ export class OpenAIServer {
   }
 
   private setupRoutes(): void {
-    // OpenAI 兼容端点
     this.app.get('/v1/models', this.listModels.bind(this));
     this.app.get('/v1/models/:model', this.getModel.bind(this));
     this.app.post('/v1/chat/completions', this.chatCompletions.bind(this));
     this.app.post('/v1/completions', this.completions.bind(this));
 
-    // 健康检查（同时检查 OpenCode 后端）
     this.app.get('/health', this.healthCheck.bind(this));
 
-    // 代理端点 - 暴露 OpenCode 原生 API 的部分能力
     this.app.get('/opencode/health', this.openCodeHealth.bind(this));
     this.app.get('/opencode/agents', this.listAgents.bind(this));
     this.app.get('/opencode/config', this.getConfig.bind(this));
@@ -216,7 +257,7 @@ export class OpenAIServer {
       const health = await this.openCodeClient.getHealth();
       res.json(health);
     } catch (error: any) {
-      res.status(502).json({ error: { message: `OpenCode 后端不可用: ${error.message}` } });
+      res.status(502).json({ error: { message: `OpenCode \u540E\u7AEF\u4E0D\u53EF\u7528: ${error.message}` } });
     }
   }
 
@@ -236,7 +277,7 @@ export class OpenAIServer {
       };
       res.json(response);
     } catch (error: any) {
-      console.error('[OpenAI Server] 获取模型列表失败:', error.message);
+      console.error('[OpenAI Server] \u83B7\u53D6\u6A21\u578B\u5217\u8868\u5931\u8D25:', error.message);
       res.status(500).json({
         error: { message: `Failed to list models: ${error.message}`, type: 'server_error', code: 'internal_error' },
       });
@@ -266,7 +307,7 @@ export class OpenAIServer {
   // ==================== Chat Completions ====================
 
   private async chatCompletions(req: Request, res: Response): Promise<void> {
-    const { model, messages, stream = false } = req.body as ChatCompletionRequest;
+    const { model, messages, stream = false, tools, tool_choice } = req.body as ChatCompletionRequest;
 
     if (!model || !messages || !Array.isArray(messages)) {
       res.status(400).json({
@@ -275,35 +316,94 @@ export class OpenAIServer {
       return;
     }
 
+    if (tool_choice === 'none') {
+      const completionId = `chatcmpl-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const created = Math.floor(Date.now() / 1000);
+      const response: ChatCompletionResponse = {
+        id: completionId,
+        object: 'chat.completion',
+        created,
+        model,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: '' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
+      res.json(response);
+      return;
+    }
+
     const completionId = `chatcmpl-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const created = Math.floor(Date.now() / 1000);
 
+    const processedMessages = this.prepareMessagesWithTools(messages, tools, tool_choice);
+
     try {
       if (stream) {
-        await this.streamChatCompletion(req, res, completionId, created, model, messages);
+        await this.streamChatCompletion(req, res, completionId, created, model, processedMessages, tools);
       } else {
-        const content = await this.openCodeClient.chat(messages, { model });
+        const result = await this.openCodeClient.chat(processedMessages, { model });
 
-        const response: ChatCompletionResponse = {
-          id: completionId,
-          object: 'chat.completion',
-          created,
-          model,
-          choices: [{
-            index: 0,
-            message: { role: 'assistant', content },
-            finish_reason: 'stop',
-          }],
-          usage: {
-            prompt_tokens: this.estimateTokens(messages),
-            completion_tokens: this.estimateTokens([{ role: 'assistant', content }]),
-            total_tokens: this.estimateTokens([...messages, { role: 'assistant', content }]),
-          },
-        };
-        res.json(response);
+        const parsedToolCalls = tools ? this.parseToolCallsFromResponse(result.content) : null;
+
+        if (parsedToolCalls && parsedToolCalls.length > 0) {
+          const textContent = this.extractTextOutsideToolCalls(result.content);
+          const response: ChatCompletionResponse = {
+            id: completionId,
+            object: 'chat.completion',
+            created,
+            model,
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: textContent || null,
+                reasoning_content: result.reasoning || null,
+                tool_calls: parsedToolCalls,
+              },
+              finish_reason: 'tool_calls',
+            }],
+            usage: {
+              prompt_tokens: this.estimateTokens(processedMessages),
+              completion_tokens: this.estimateTokens([{ role: 'assistant', content: result.content }]),
+              total_tokens: this.estimateTokens([...processedMessages, { role: 'assistant', content: result.content }]),
+              completion_tokens_details: {
+                reasoning_tokens: result.reasoning ? this.estimateTokens([{ role: 'assistant', content: result.reasoning }]) : 0,
+              },
+            },
+          };
+          res.json(response);
+        } else {
+          const response: ChatCompletionResponse = {
+            id: completionId,
+            object: 'chat.completion',
+            created,
+            model,
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: result.content,
+                reasoning_content: result.reasoning || null,
+              },
+              finish_reason: 'stop',
+            }],
+            usage: {
+              prompt_tokens: this.estimateTokens(processedMessages),
+              completion_tokens: this.estimateTokens([{ role: 'assistant', content: result.content }]),
+              total_tokens: this.estimateTokens([...processedMessages, { role: 'assistant', content: result.content }]),
+              completion_tokens_details: {
+                reasoning_tokens: result.reasoning ? this.estimateTokens([{ role: 'assistant', content: result.reasoning }]) : 0,
+              },
+            },
+          };
+          res.json(response);
+        }
       }
     } catch (error: any) {
-      console.error('[OpenAI Server] Chat completion 失败:', error.message);
+      console.error('[OpenAI Server] Chat completion \u5931\u8D25:', error.message);
       if (!res.headersSent) {
         res.status(500).json({
           error: { message: `Chat completion failed: ${error.message}`, type: 'server_error', code: 'internal_error' },
@@ -312,10 +412,6 @@ export class OpenAIServer {
     }
   }
 
-  /**
-   * 真正的流式 Chat Completion
-   * 通过 OpenCode 的 SSE 事件流实时转发
-   */
   private async streamChatCompletion(
     req: Request,
     res: Response,
@@ -323,22 +419,18 @@ export class OpenAIServer {
     created: number,
     model: string,
     messages: ChatMessage[],
+    tools?: ToolDefinition[],
   ): Promise<void> {
-    // 先尝试使用 SSE 事件流实现真正的流式
     try {
-      await this.streamChatViaSSE(req, res, completionId, created, model, messages);
+      await this.streamChatViaSSE(req, res, completionId, created, model, messages, tools);
     } catch (sseError: any) {
-      // SSE 流式失败时回退到伪流式
-      console.warn('[OpenAI Server] SSE 流式失败，回退到伪流式:', sseError.message);
+      console.warn('[OpenAI Server] SSE \u6D41\u5F0F\u5931\u8D25\uFF0C\u56DE\u9000\u5230\u4F2A\u6D41\u5F0F:', sseError.message);
       if (!res.headersSent) {
-        await this.streamChatFallback(req, res, completionId, created, model, messages);
+        await this.streamChatFallback(req, res, completionId, created, model, messages, tools);
       }
     }
   }
 
-  /**
-   * 通过 OpenCode SSE 事件流实现真正的流式响应
-   */
   private async streamChatViaSSE(
     req: Request,
     res: Response,
@@ -346,13 +438,13 @@ export class OpenAIServer {
     created: number,
     model: string,
     messages: ChatMessage[],
+    tools?: ToolDefinition[],
   ): Promise<void> {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
-    // 发送首个 chunk（role）
     const roleChunk: ChatCompletionChunk = {
       id: completionId,
       object: 'chat.completion.chunk',
@@ -362,8 +454,10 @@ export class OpenAIServer {
     };
     res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
-    // 使用 client 的 chatStream 方法
-    const fullText = await this.openCodeClient.chatStream(messages, (delta) => {
+    let fullText = '';
+
+    const onChunk = (delta: string) => {
+      fullText += delta;
       const chunk: ChatCompletionChunk = {
         id: completionId,
         object: 'chat.completion.chunk',
@@ -372,24 +466,79 @@ export class OpenAIServer {
         choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
       };
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    }, { model });
-
-    // 发送结束 chunk
-    const finalChunk: ChatCompletionChunk = {
-      id: completionId,
-      object: 'chat.completion.chunk',
-      created,
-      model,
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     };
-    res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+
+    const onReasoning = (delta: string) => {
+      const chunk: ChatCompletionChunk = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }],
+      };
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    };
+
+    await this.openCodeClient.chatStream(messages, onChunk, { model }, onReasoning);
+
+    if (tools) {
+      const parsedToolCalls = this.parseToolCallsFromResponse(fullText);
+      if (parsedToolCalls && parsedToolCalls.length > 0) {
+        for (let i = 0; i < parsedToolCalls.length; i++) {
+          const tc = parsedToolCalls[i];
+          const tcChunk: ChatCompletionChunk = {
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: i,
+                  id: tc.id,
+                  type: 'function' as const,
+                  function: { name: tc.function.name, arguments: tc.function.arguments },
+                }],
+              },
+              finish_reason: null,
+            }],
+          };
+          res.write(`data: ${JSON.stringify(tcChunk)}\n\n`);
+        }
+        const finalChunk: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+        };
+        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+      } else {
+        const finalChunk: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        };
+        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+      }
+    } else {
+      const finalChunk: ChatCompletionChunk = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      };
+      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+    }
+
     res.write('data: [DONE]\n\n');
     res.end();
   }
 
-  /**
-   * 伪流式回退：先获取完整内容，再分段发送
-   */
   private async streamChatFallback(
     req: Request,
     res: Response,
@@ -397,15 +546,15 @@ export class OpenAIServer {
     created: number,
     model: string,
     messages: ChatMessage[],
+    tools?: ToolDefinition[],
   ): Promise<void> {
-    const content = await this.openCodeClient.chat(messages, { model });
+    const result = await this.openCodeClient.chat(messages, { model });
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
-    // 角色 chunk
     const roleChunk: ChatCompletionChunk = {
       id: completionId,
       object: 'chat.completion.chunk',
@@ -415,8 +564,22 @@ export class OpenAIServer {
     };
     res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
-    // 分段发送内容
-    const chunks = this.splitIntoChunks(content, 10);
+    if (result.reasoning) {
+      const reasoningChunks = this.splitIntoChunks(result.reasoning, 10);
+      for (const chunk of reasoningChunks) {
+        const data: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }],
+        };
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        await this.delay(30);
+      }
+    }
+
+    const chunks = this.splitIntoChunks(result.content, 10);
     for (const chunk of chunks) {
       const data: ChatCompletionChunk = {
         id: completionId,
@@ -429,15 +592,60 @@ export class OpenAIServer {
       await this.delay(30);
     }
 
-    // 结束 chunk
-    const finalChunk: ChatCompletionChunk = {
-      id: completionId,
-      object: 'chat.completion.chunk',
-      created,
-      model,
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-    };
-    res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+    if (tools) {
+      const parsedToolCalls = this.parseToolCallsFromResponse(result.content);
+      if (parsedToolCalls && parsedToolCalls.length > 0) {
+        for (let i = 0; i < parsedToolCalls.length; i++) {
+          const tc = parsedToolCalls[i];
+          const tcChunk: ChatCompletionChunk = {
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: i,
+                  id: tc.id,
+                  type: 'function' as const,
+                  function: { name: tc.function.name, arguments: tc.function.arguments },
+                }],
+              },
+              finish_reason: null,
+            }],
+          };
+          res.write(`data: ${JSON.stringify(tcChunk)}\n\n`);
+        }
+        const finalChunk: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+        };
+        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+      } else {
+        const finalChunk: ChatCompletionChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        };
+        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+      }
+    } else {
+      const finalChunk: ChatCompletionChunk = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      };
+      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+    }
+
     res.write('data: [DONE]\n\n');
     res.end();
   }
@@ -465,24 +673,24 @@ export class OpenAIServer {
       if (stream) {
         await this.streamCompletion(req, res, completionId, created, model, messages);
       } else {
-        const content = await this.openCodeClient.chat(messages, { model });
+        const result = await this.openCodeClient.chat(messages, { model });
 
         const response: CompletionResponse = {
           id: completionId,
           object: 'text_completion',
           created,
           model,
-          choices: [{ index: 0, text: content, finish_reason: 'stop' }],
+          choices: [{ index: 0, text: result.content, finish_reason: 'stop' }],
           usage: {
             prompt_tokens: this.estimateTokens(messages),
-            completion_tokens: this.estimateTokens([{ role: 'assistant', content }]),
-            total_tokens: this.estimateTokens([...messages, { role: 'assistant', content }]),
+            completion_tokens: this.estimateTokens([{ role: 'assistant', content: result.content }]),
+            total_tokens: this.estimateTokens([...messages, { role: 'assistant', content: result.content }]),
           },
         };
         res.json(response);
       }
     } catch (error: any) {
-      console.error('[OpenAI Server] Completion 失败:', error.message);
+      console.error('[OpenAI Server] Completion \u5931\u8D25:', error.message);
       if (!res.headersSent) {
         res.status(500).json({
           error: { message: `Completion failed: ${error.message}`, type: 'server_error', code: 'internal_error' },
@@ -499,7 +707,6 @@ export class OpenAIServer {
     model: string,
     messages: ChatMessage[],
   ): Promise<void> {
-    // 尝试真正的流式
     try {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -528,12 +735,10 @@ export class OpenAIServer {
       res.write('data: [DONE]\n\n');
       res.end();
     } catch (sseError: any) {
-      // 回退到伪流式
       if (!res.headersSent) {
-        console.warn('[OpenAI Server] 流式 Completion 失败，回退到伪流式:', sseError.message);
+        console.warn('[OpenAI Server] \u6D41\u5F0F Completion \u5931\u8D25\uFF0C\u56DE\u9000\u5230\u4F2A\u6D41\u5F0F:', sseError.message);
         await this.streamCompletionFallback(req, res, completionId, created, model, messages);
       } else {
-        // headers 已发送，无法回退
         res.write(`data: ${JSON.stringify({ error: { message: `Stream failed: ${sseError.message}` } })}\n\n`);
         res.end();
       }
@@ -548,14 +753,14 @@ export class OpenAIServer {
     model: string,
     messages: ChatMessage[],
   ): Promise<void> {
-    const content = await this.openCodeClient.chat(messages, { model });
+    const result = await this.openCodeClient.chat(messages, { model });
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
-    const chunks = this.splitIntoChunks(content, 10);
+    const chunks = this.splitIntoChunks(result.content, 10);
     for (const chunk of chunks) {
       const data: CompletionChunk = {
         id: completionId,
@@ -587,7 +792,7 @@ export class OpenAIServer {
       const agents = await this.openCodeClient.listAgents();
       res.json(agents);
     } catch (error: any) {
-      res.status(502).json({ error: { message: `获取代理列表失败: ${error.message}` } });
+      res.status(502).json({ error: { message: `\u83B7\u53D6\u4EE3\u7406\u5217\u8868\u5931\u8D25: ${error.message}` } });
     }
   }
 
@@ -596,11 +801,197 @@ export class OpenAIServer {
       const config = await this.openCodeClient.getConfig();
       res.json(config);
     } catch (error: any) {
-      res.status(502).json({ error: { message: `获取配置失败: ${error.message}` } });
+      res.status(502).json({ error: { message: `\u83B7\u53D6\u914D\u7F6E\u5931\u8D25: ${error.message}` } });
     }
   }
 
-  // ==================== 工具方法 ====================
+  // ==================== 工具调用核心方法 ====================
+
+  private generateToolSystemPrompt(tools: ToolDefinition[], toolChoice?: ToolChoice): string {
+    const toolDescriptions = tools.map(tool => {
+      const fn = tool.function;
+      const params = fn.parameters
+        ? JSON.stringify(fn.parameters, null, 2)
+        : '{}';
+      return `### ${fn.name}\n${fn.description || ''}\nParameters:\n${params}`;
+    }).join('\n\n');
+
+    let choiceInstruction = '';
+    if (toolChoice === 'required') {
+      choiceInstruction = '\nYou MUST call at least one tool in your response. Do not respond with only text.';
+    } else if (typeof toolChoice === 'object' && toolChoice.type === 'function') {
+      choiceInstruction = `\nYou MUST call the function "${toolChoice.function.name}" in your response.`;
+    }
+
+    return [
+      'You have access to the following tools:',
+      '',
+      toolDescriptions,
+      '',
+      `To call a tool, output a JSON block in the following format:`,
+      `${TOOL_CALL_OPEN_TAG}`,
+      `{"name": "function_name", "arguments": {"arg1": "value1", "arg2": "value2"}}`,
+      `${TOOL_CALL_CLOSE_TAG}`,
+      '',
+      `You can call multiple tools by using multiple ${TOOL_CALL_OPEN_TAG}/${TOOL_CALL_CLOSE_TAG} blocks.`,
+      'You may also include text before or after the tool calls.',
+      `If you do not need to call any tool, just respond normally without any ${TOOL_CALL_OPEN_TAG}/${TOOL_CALL_CLOSE_TAG} blocks.`,
+      choiceInstruction,
+    ].join('\n');
+  }
+
+  private prepareMessagesWithTools(
+    messages: ChatMessage[],
+    tools?: ToolDefinition[],
+    toolChoice?: ToolChoice,
+  ): ChatMessage[] {
+    const processed: ChatMessage[] = [];
+    const hasToolRelatedMessages = messages.some(
+      m => m.role === 'tool' || (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0)
+    );
+
+    if (tools && tools.length > 0) {
+      const toolPrompt = this.generateToolSystemPrompt(tools, toolChoice);
+      const existingSystem = messages.find(m => m.role === 'system');
+      if (existingSystem) {
+        const systemContent = typeof existingSystem.content === 'string'
+          ? existingSystem.content
+          : this.extractTextFromContent(existingSystem.content);
+        processed.push({
+          role: 'system',
+          content: `${systemContent}\n\n${toolPrompt}`,
+        });
+      } else {
+        processed.push({ role: 'system', content: toolPrompt });
+      }
+    }
+
+    for (const msg of messages) {
+      if (tools && tools.length > 0 && msg.role === 'system') {
+        continue;
+      }
+
+      if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        let content = '';
+        if (msg.content && typeof msg.content === 'string' && msg.content.trim()) {
+          content = msg.content + '\n\n';
+        }
+        for (const tc of msg.tool_calls) {
+          content += `${TOOL_CALL_OPEN_TAG}\n{"name": "${tc.function.name}", "arguments": ${tc.function.arguments}}\n${TOOL_CALL_CLOSE_TAG}\n`;
+        }
+        processed.push({ role: 'assistant', content });
+      } else if (msg.role === 'tool') {
+        const toolCallId = msg.tool_call_id || 'unknown';
+        const toolName = msg.name || 'unknown';
+        const resultContent = typeof msg.content === 'string'
+          ? msg.content
+          : this.extractTextFromContent(msg.content);
+        processed.push({
+          role: 'user',
+          content: `[Tool Result for ${toolName} (id: ${toolCallId})]:\n${resultContent}`,
+        });
+      } else {
+        processed.push({ ...msg });
+      }
+    }
+
+    return processed;
+  }
+
+  private extractTextFromContent(content: string | any[] | null): string {
+    if (!content) return '';
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content
+        .filter((part: any) => part && part.type === 'text' && typeof part.text === 'string')
+        .map((part: any) => part.text)
+        .join('');
+    }
+    return String(content);
+  }
+
+  private parseToolCallsFromResponse(content: string): ToolCall[] | null {
+    const toolCalls: ToolCall[] = [];
+
+    const openEscaped = TOOL_CALL_OPEN_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const closeEscaped = TOOL_CALL_CLOSE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`${openEscaped}\\s*([\\s\\S]*?)\\s*${closeEscaped}`, 'g');
+    let match;
+
+    while ((match = regex.exec(content)) !== null) {
+      const jsonStr = match[1].trim();
+      try {
+        const parsed = JSON.parse(jsonStr);
+        if (parsed.name) {
+          toolCalls.push({
+            id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            type: 'function',
+            function: {
+              name: parsed.name,
+              arguments: typeof parsed.arguments === 'string'
+                ? parsed.arguments
+                : JSON.stringify(parsed.arguments || {}),
+            },
+          });
+        }
+      } catch (e) {
+        console.warn('[OpenAI Server] \u89E3\u6790\u5DE5\u5177\u8C03\u7528 JSON \u5931\u8D25:', jsonStr.substring(0, 100));
+      }
+    }
+
+    if (toolCalls.length === 0) {
+      const jsonBlockRegex = /```(?:json)?\s*\n?([\s\S]*?)\n?```/g;
+      while ((match = jsonBlockRegex.exec(content)) !== null) {
+        const jsonStr = match[1].trim();
+        try {
+          const parsed = JSON.parse(jsonStr);
+          if (parsed.name && parsed.arguments) {
+            toolCalls.push({
+              id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              type: 'function',
+              function: {
+                name: parsed.name,
+                arguments: typeof parsed.arguments === 'string'
+                  ? parsed.arguments
+                  : JSON.stringify(parsed.arguments),
+              },
+            });
+          }
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) {
+              if (item.name && item.arguments) {
+                toolCalls.push({
+                  id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                  type: 'function',
+                  function: {
+                    name: item.name,
+                    arguments: typeof item.arguments === 'string'
+                      ? item.arguments
+                      : JSON.stringify(item.arguments),
+                  },
+                });
+              }
+            }
+          }
+        } catch {
+          // not valid JSON, skip
+        }
+      }
+    }
+
+    return toolCalls.length > 0 ? toolCalls : null;
+  }
+
+  private extractTextOutsideToolCalls(content: string): string {
+    const openEscaped = TOOL_CALL_OPEN_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const closeEscaped = TOOL_CALL_CLOSE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`${openEscaped}[\\s\\S]*?${closeEscaped}`, 'g');
+    let text = content.replace(regex, '').trim();
+    text = text.replace(/```(?:json)?\s*\n?\{"name":\s*"[^"]+",\s*"arguments":\s*\{[\s\S]*?\}\s*\}\n?```/g, '').trim();
+    return text || '';
+  }
+
+  // ==================== 通用工具方法 ====================
 
   private splitIntoChunks(text: string, chunkSize: number): string[] {
     const chunks: string[] = [];
@@ -614,8 +1005,12 @@ export class OpenAIServer {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  private estimateTokens(messages: Array<{ role?: string; content: string | any[] }>): number {
-    const text = messages.map(m => typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).join(' ');
+  private estimateTokens(messages: Array<{ role?: string; content: string | any[] | null }>): number {
+    const text = messages.map(m => {
+      if (typeof m.content === 'string') return m.content;
+      if (m.content) return JSON.stringify(m.content);
+      return '';
+    }).join(' ');
     return Math.ceil(text.length / 4);
   }
 
@@ -624,16 +1019,16 @@ export class OpenAIServer {
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.server = this.app.listen(this.port, this.hostname, () => {
-        console.log(`[OpenAI Server] 服务已启动: http://${this.hostname}:${this.port}`);
-        console.log(`[OpenAI Server] 健康检查: http://${this.hostname}:${this.port}/health`);
-        console.log(`[OpenAI Server] 模型列表: http://${this.hostname}:${this.port}/v1/models`);
-        console.log(`[OpenAI Server] OpenCode 后端: ${this.openCodeClient.getBaseUrl()}`);
+        console.log(`[OpenAI Server] \u670D\u52A1\u5DF2\u542F\u52A8: http://${this.hostname}:${this.port}`);
+        console.log(`[OpenAI Server] \u5065\u5EB7\u68C0\u67E5: http://${this.hostname}:${this.port}/health`);
+        console.log(`[OpenAI Server] \u6A21\u578B\u5217\u8868: http://${this.hostname}:${this.port}/v1/models`);
+        console.log(`[OpenAI Server] OpenCode \u540E\u7AEF: ${this.openCodeClient.getBaseUrl()}`);
         resolve();
       });
 
       this.server.on('error', (error: any) => {
         if (error.code === 'EADDRINUSE') {
-          reject(new Error(`端口 ${this.port} 已被占用`));
+          reject(new Error(`\u7AEF\u53E3 ${this.port} \u5DF2\u88AB\u5360\u7528`));
         } else {
           reject(error);
         }
@@ -645,7 +1040,7 @@ export class OpenAIServer {
     return new Promise((resolve) => {
       if (this.server) {
         this.server.close(() => {
-          console.log('[OpenAI Server] 服务已停止');
+          console.log('[OpenAI Server] \u670D\u52A1\u5DF2\u505C\u6B62');
           resolve();
         });
       } else {
